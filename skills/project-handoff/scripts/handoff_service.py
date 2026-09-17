@@ -23,6 +23,10 @@ class HandoffValidationError(ValueError):
     """A validation error whose fixed message is safe for CLI output."""
 
 
+class PublicationRollbackError(OSError):
+    """A failed rollback means publication containment is uncertain."""
+
+
 class HandoffService:
     def __init__(
         self,
@@ -76,7 +80,7 @@ class HandoffService:
                 continue
             claimed = self.store.claim_expired(pending_id)
             if claimed is None:
-                return None
+                continue
             return self._transfer_claimed(claimed)
 
     def status(self, session_id):
@@ -210,6 +214,8 @@ class HandoffService:
         try:
             self._publish_project(cwd, target, handoff_text)
             return target
+        except PublicationRollbackError:
+            raise
         except OSError:
             fallback = self._private_target(pending_id)
             self._publish_private(fallback, handoff_text)
@@ -234,6 +240,8 @@ class HandoffService:
         The replacement is anchored to a verified parent descriptor. A rename
         after the final identity check can make the prompt path stale, but it
         cannot redirect the already-completed write through a symlink.
+        Rollback compares the published inode before unlinking; POSIX stdlib
+        cannot make that comparison and unlink one indivisible operation.
         """
         relative = target.relative_to(cwd)
         if not relative.parts or relative.name in {"", ".", ".."}:
@@ -254,6 +262,14 @@ class HandoffService:
                 handle.write(handoff_text)
                 handle.flush()
                 os.fsync(handle.fileno())
+                published_identity = HandoffService._file_identity(
+                    os.fstat(handle.fileno())
+                )
+            HandoffService._verify_project_parent(
+                cwd,
+                parent_parts,
+                parent_fd,
+            )
             os.replace(
                 temporary_name,
                 relative.name,
@@ -261,22 +277,25 @@ class HandoffService:
                 dst_dir_fd=parent_fd,
             )
             temporary_name = None
-            os.fsync(parent_fd)
-            verification_fd = HandoffService._open_project_parent(
-                cwd,
-                parent_parts,
-                create=False,
-            )
             try:
-                published_parent = os.fstat(parent_fd)
-                current_parent = os.fstat(verification_fd)
-                if (
-                    published_parent.st_dev,
-                    published_parent.st_ino,
-                ) != (current_parent.st_dev, current_parent.st_ino):
-                    raise OSError("project target parent changed during publish")
-            finally:
-                os.close(verification_fd)
+                os.fsync(parent_fd)
+                HandoffService._verify_project_parent(
+                    cwd,
+                    parent_parts,
+                    parent_fd,
+                )
+            except OSError:
+                try:
+                    HandoffService._rollback_published_file(
+                        parent_fd,
+                        relative.name,
+                        published_identity,
+                    )
+                except OSError as rollback_error:
+                    raise PublicationRollbackError(
+                        "unable to roll back unsafe project publication"
+                    ) from rollback_error
+                raise
         finally:
             if temporary_name is not None:
                 try:
@@ -284,6 +303,36 @@ class HandoffService:
                 except FileNotFoundError:
                     pass
             os.close(parent_fd)
+
+    @staticmethod
+    def _verify_project_parent(cwd, parent_parts, parent_fd):
+        verification_fd = HandoffService._open_project_parent(
+            cwd,
+            parent_parts,
+            create=False,
+        )
+        try:
+            if HandoffService._file_identity(
+                os.fstat(parent_fd)
+            ) != HandoffService._file_identity(os.fstat(verification_fd)):
+                raise OSError("project target parent changed during publish")
+        finally:
+            os.close(verification_fd)
+
+    @staticmethod
+    def _rollback_published_file(parent_fd, name, published_identity):
+        try:
+            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError as error:
+            raise OSError("published project target disappeared") from error
+        if HandoffService._file_identity(current) != published_identity:
+            raise OSError("published project target changed before rollback")
+        os.unlink(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+
+    @staticmethod
+    def _file_identity(metadata):
+        return metadata.st_dev, metadata.st_ino
 
     @staticmethod
     def _open_project_parent(cwd, parent_parts, create):
@@ -338,7 +387,17 @@ class HandoffService:
                 descriptor = os.open(name, flags, 0o600, dir_fd=parent_fd)
             except FileExistsError:
                 continue
-            os.fchmod(descriptor, 0o600)
+            try:
+                os.fchmod(descriptor, 0o600)
+            except BaseException:
+                try:
+                    os.close(descriptor)
+                finally:
+                    try:
+                        os.unlink(name, dir_fd=parent_fd)
+                    except FileNotFoundError:
+                        pass
+                raise
             return name, descriptor
         raise OSError("unable to create handoff temporary file")
 

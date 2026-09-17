@@ -144,6 +144,47 @@ class HandoffServiceTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
         self.assertEqual(target.parent.stat().st_mode & 0o022, 0)
 
+    def test_temp_creation_cleans_up_if_permission_update_fails(self):
+        parent = self.root / "parent"
+        parent.mkdir()
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        real_open = os.open
+        opened_descriptors = []
+
+        def record_open(*args, **kwargs):
+            descriptor = real_open(*args, **kwargs)
+            opened_descriptors.append(descriptor)
+            return descriptor
+
+        try:
+            with mock.patch(
+                "handoff_service.os.open",
+                side_effect=record_open,
+            ), mock.patch(
+                "handoff_service.os.fchmod",
+                side_effect=OSError("permission update failed"),
+            ):
+                with self.assertRaisesRegex(OSError, "permission update failed"):
+                    HandoffService._create_temp_at(parent_fd)
+
+            leaked_fd = opened_descriptors[0]
+            try:
+                os.fstat(leaked_fd)
+            except OSError:
+                descriptor_is_open = False
+            else:
+                descriptor_is_open = True
+            remaining_entries = list(parent.iterdir())
+            if descriptor_is_open:
+                os.close(leaked_fd)
+            for entry in remaining_entries:
+                entry.unlink()
+
+            self.assertFalse(descriptor_is_open)
+            self.assertEqual(remaining_entries, [])
+        finally:
+            os.close(parent_fd)
+
     @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
     def test_confirm_is_single_winner_across_processes(self):
         service, _client, clock = self.make_service()
@@ -223,6 +264,37 @@ class HandoffServiceTests(unittest.TestCase):
         result = service.wait_and_expire(pending_id)
 
         self.assertEqual(clock.sleeps, [300.0, 250.0, 350.0])
+        self.assertEqual(result["state"], "transferred")
+        self.assertEqual(target.read_text(), VALID_HANDOFF)
+        self.assertEqual(len(client.calls), 1)
+
+    def test_wait_rechecks_when_locked_expiry_claim_sees_clock_move_back(self):
+        timeline = iter((100.0, 100.0, 400.0, 350.0, 350.0, 400.0, 400.0))
+        last_time = 100.0
+
+        def now():
+            nonlocal last_time
+            try:
+                last_time = next(timeline)
+            except StopIteration:
+                pass
+            return last_time
+
+        sleeps = []
+        client = RecordingClient()
+        service = HandoffService(
+            store=StateStore(self.root / "state", now=now),
+            app_server_client=client,
+            private_handoff_dir=self.root / "private",
+            sleeper=sleeps.append,
+        )
+        target = self.root / "docs" / "AI-HANDOFF.md"
+        pending_id = service.prepare(self.root, VALID_HANDOFF, target)
+        service.arm(pending_id, "thr-old", 300)
+
+        result = service.wait_and_expire(pending_id)
+
+        self.assertEqual(sleeps, [50.0])
         self.assertEqual(result["state"], "transferred")
         self.assertEqual(target.read_text(), VALID_HANDOFF)
         self.assertEqual(len(client.calls), 1)
@@ -463,6 +535,136 @@ class HandoffServiceTests(unittest.TestCase):
             private_copy = self.root / "private" / f"{pending_id}.md"
             self.assertEqual(result["state"], "transferred")
             self.assertFalse((outside / target.name).exists())
+            self.assertEqual(private_copy.read_text(), VALID_HANDOFF)
+            self.assertIn(str(private_copy), client.calls[0][1])
+
+    def test_parent_moved_outside_is_rolled_back_before_private_fallback(self):
+        service, client, _clock = self.make_service()
+        target = self.root / "docs" / "AI-HANDOFF.md"
+        pending_id = service.prepare(self.root, VALID_HANDOFF, target)
+        service.arm(pending_id, "thr-old", 300)
+        target.parent.mkdir()
+        real_replace = os.replace
+
+        with tempfile.TemporaryDirectory() as outside_name:
+            displaced = Path(outside_name) / "displaced-docs"
+            moved = False
+
+            def move_parent_outside(source, destination, *args, **kwargs):
+                nonlocal moved
+                is_project_publish = (
+                    destination == target.name and "dst_dir_fd" in kwargs
+                )
+                if not moved and is_project_publish:
+                    moved = True
+                    target.parent.rename(displaced)
+                return real_replace(source, destination, *args, **kwargs)
+
+            with mock.patch(
+                "handoff_service.os.replace",
+                side_effect=move_parent_outside,
+            ):
+                result = service.confirm(pending_id)
+
+            private_copy = self.root / "private" / f"{pending_id}.md"
+            self.assertEqual(result["state"], "transferred")
+            self.assertFalse((displaced / target.name).exists())
+            self.assertEqual(private_copy.read_text(), VALID_HANDOFF)
+            self.assertIn(str(private_copy), client.calls[0][1])
+
+    def test_rollback_failure_marks_failed_and_does_not_launch(self):
+        service, client, _clock = self.make_service()
+        target = self.root / "docs" / "AI-HANDOFF.md"
+        pending_id = service.prepare(self.root, VALID_HANDOFF, target)
+        service.arm(pending_id, "thr-old", 300)
+        target.parent.mkdir()
+        real_replace = os.replace
+        real_unlink = os.unlink
+
+        with tempfile.TemporaryDirectory() as outside_name:
+            displaced = Path(outside_name) / "displaced-docs"
+            moved = False
+
+            def move_parent_outside(source, destination, *args, **kwargs):
+                nonlocal moved
+                is_project_publish = (
+                    destination == target.name and "dst_dir_fd" in kwargs
+                )
+                if not moved and is_project_publish:
+                    moved = True
+                    target.parent.rename(displaced)
+                return real_replace(source, destination, *args, **kwargs)
+
+            def deny_destination_rollback(name, *args, **kwargs):
+                if name == target.name and "dir_fd" in kwargs:
+                    raise PermissionError("rollback denied")
+                return real_unlink(name, *args, **kwargs)
+
+            with mock.patch(
+                "handoff_service.os.replace",
+                side_effect=move_parent_outside,
+            ), mock.patch(
+                "handoff_service.os.unlink",
+                side_effect=deny_destination_rollback,
+            ):
+                with self.assertRaisesRegex(OSError, "roll back unsafe"):
+                    service.confirm(pending_id)
+
+            private_copy = self.root / "private" / f"{pending_id}.md"
+            self.assertEqual(service.status("thr-old")["state"], "failed")
+            self.assertEqual(private_copy.read_text(), VALID_HANDOFF)
+            self.assertTrue((displaced / target.name).exists())
+            self.assertEqual(client.calls, [])
+
+    def test_post_replace_fsync_failure_rolls_back_displaced_destination(self):
+        service, client, _clock = self.make_service()
+        target = self.root / "docs" / "AI-HANDOFF.md"
+        pending_id = service.prepare(self.root, VALID_HANDOFF, target)
+        service.arm(pending_id, "thr-old", 300)
+        target.parent.mkdir()
+        real_replace = os.replace
+        real_fsync = os.fsync
+
+        with tempfile.TemporaryDirectory() as outside_name:
+            displaced = Path(outside_name) / "displaced-docs"
+            moved = False
+            fsync_failed = False
+
+            def move_parent_outside(source, destination, *args, **kwargs):
+                nonlocal moved
+                is_project_publish = (
+                    destination == target.name and "dst_dir_fd" in kwargs
+                )
+                if not moved and is_project_publish:
+                    moved = True
+                    target.parent.rename(displaced)
+                return real_replace(source, destination, *args, **kwargs)
+
+            def fail_displaced_parent_fsync(descriptor):
+                nonlocal fsync_failed
+                if moved and not fsync_failed and displaced.exists():
+                    opened = os.fstat(descriptor)
+                    moved_parent = displaced.stat()
+                    if (opened.st_dev, opened.st_ino) == (
+                        moved_parent.st_dev,
+                        moved_parent.st_ino,
+                    ):
+                        fsync_failed = True
+                        raise OSError("directory fsync failed")
+                return real_fsync(descriptor)
+
+            with mock.patch(
+                "handoff_service.os.replace",
+                side_effect=move_parent_outside,
+            ), mock.patch(
+                "handoff_service.os.fsync",
+                side_effect=fail_displaced_parent_fsync,
+            ):
+                result = service.confirm(pending_id)
+
+            private_copy = self.root / "private" / f"{pending_id}.md"
+            self.assertEqual(result["state"], "transferred")
+            self.assertFalse((displaced / target.name).exists())
             self.assertEqual(private_copy.read_text(), VALID_HANDOFF)
             self.assertIn(str(private_copy), client.calls[0][1])
 
