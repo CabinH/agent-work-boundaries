@@ -196,13 +196,21 @@ def _handle_user_prompt(payload, service, spawn_worker):
     if not isinstance(prompt, str):
         return None
 
-    status = service.status(session_id)
-    terminal_output = _terminal_prompt_output(status, session_id)
-    if terminal_output is not None:
-        return terminal_output
-
     responded = service.respond(session_id)
     if responded is not None:
+        fence_result = responded.get("prompt_fence_result")
+        if fence_result == "responded":
+            return _responded_prompt_output(responded)
+        if fence_result == "observed":
+            terminal_output = _terminal_prompt_output(
+                responded,
+                session_id,
+            )
+            if terminal_output is not None:
+                return terminal_output
+            if responded.get("state") == "armed":
+                return _in_progress_block(session_id)
+            return None
         return _revalidate_prompt_response(
             service,
             session_id,

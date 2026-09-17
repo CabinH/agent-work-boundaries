@@ -37,6 +37,14 @@ _ATTEMPT_DIAGNOSTIC_KEYS = (
 )
 _REQUEST_HISTORY_LIMIT = 20
 _AUTHORITY_RETRY_LIMIT = 8
+_SESSION_METADATA_KEYS = (
+    "compaction_count",
+    "compaction_sources",
+    "prompt_fence_generation",
+    "prompt_fence_prepare_sequence",
+    "prompt_fence_at",
+    "prompt_fence_result",
+)
 
 
 class StateAuthorityError(RuntimeError):
@@ -52,6 +60,7 @@ class StateStore:
         self.pending_dir = self.root / "pending"
         self.sessions_dir = self.root / "sessions"
         self.locks_dir = self.root / "locks"
+        self.prepare_sequence_path = self.root / "prepare-sequence.json"
         for directory in (
             self.root,
             self.pending_dir,
@@ -68,8 +77,10 @@ class StateStore:
         target_path: str,
     ) -> dict[str, object]:
         pending_id = str(uuid.uuid4())
+        prepare_sequence = self._allocate_prepare_sequence()
         record: dict[str, object] = {
             "pending_id": pending_id,
+            "prepare_sequence": prepare_sequence,
             "state": "draft",
             "cwd": cwd,
             "handoff_text": handoff_text,
@@ -102,45 +113,77 @@ class StateStore:
                     if session_path.exists()
                     else None
                 )
+                if self._record_is_prompt_fenced(record, cached):
+                    self._set_state(record, "cancelled")
+                    record["cancelled_at"] = self.now()
+                    record["cancel_reason"] = "prompt_fenced"
+                    self._copy_session_metadata(cached, record)
+                    self._write_record(
+                        self._pending_path(pending_id),
+                        record,
+                    )
+                    return None
                 record["generation"] = (
                     self._max_session_generation(session_id, cached) + 1
                 )
-                self._copy_compaction_metadata(cached, record)
+                self._copy_session_metadata(cached, record)
                 self._write_record(self._pending_path(pending_id), record)
                 self._write_record(session_path, record)
             return record
 
     def respond(self, session_id: str) -> dict[str, object] | None:
         session_path = self._session_path(session_id)
-        for _attempt in range(_AUTHORITY_RETRY_LIMIT):
-            session_record = self.get_session_status(session_id)
-            if session_record is None or "pending_id" not in session_record:
-                return None
-            pending_id = str(session_record["pending_id"])
-            with self._locked(pending_id):
-                record = self._read_record(self._pending_path(pending_id))
-                with self._session_locked(session_id):
-                    cached = (
-                        self._read_record(session_path)
-                        if session_path.exists()
-                        else None
-                    )
-                    if not self._same_bound_generation(record, cached):
+        with self._prepare_sequence_locked():
+            fence_sequence = self._latest_prepare_sequence_locked()
+            for _attempt in range(_AUTHORITY_RETRY_LIMIT):
+                session_record = self.get_session_status(session_id)
+                if session_record is None or "pending_id" not in session_record:
+                    with self._session_locked(session_id):
+                        cached = (
+                            self._read_record(session_path)
+                            if session_path.exists()
+                            else None
+                        )
+                        if cached is not None and "pending_id" in cached:
+                            continue
+                        record = dict(cached or {"session_id": session_id})
+                        self._advance_prompt_fence(
+                            record,
+                            fence_sequence,
+                        )
+                        record["prompt_fence_result"] = "observed"
+                        self._write_record(session_path, record)
+                        return self._prompt_fence_proof(record, "observed")
+                pending_id = str(session_record["pending_id"])
+                with self._locked(pending_id):
+                    pending_path = self._pending_path(pending_id)
+                    if not pending_path.exists():
                         continue
-                    if record["state"] != "armed":
-                        return None
-                    timestamp = self.now()
-                    if timestamp >= float(record["deadline_at"]):
-                        return None
-                    self._set_state(record, "responded")
-                    record["responded_at"] = timestamp
-                    self._copy_compaction_metadata(cached, record)
-                    self._write_record(
-                        self._pending_path(pending_id),
-                        record,
-                    )
-                    self._write_record(session_path, record)
-                    return record
+                    record = self._read_record(pending_path)
+                    if record.get("session_id") != session_id:
+                        continue
+                    with self._session_locked(session_id):
+                        cached = (
+                            self._read_record(session_path)
+                            if session_path.exists()
+                            else None
+                        )
+                        if not self._same_bound_generation(record, cached):
+                            continue
+                        result = "observed"
+                        if record["state"] == "armed":
+                            self._set_state(record, "responded")
+                            record["responded_at"] = self.now()
+                            result = "responded"
+                        self._copy_session_metadata(cached, record)
+                        self._advance_prompt_fence(
+                            record,
+                            fence_sequence,
+                        )
+                        record["prompt_fence_result"] = result
+                        self._write_record(pending_path, record)
+                        self._write_record(session_path, record)
+                        return self._prompt_fence_proof(record, result)
         raise StateAuthorityError("session authority changed repeatedly")
 
     def claim_confirm(self, pending_id: str) -> dict[str, object] | None:
@@ -161,16 +204,42 @@ class StateStore:
             record = self._read_record(self._pending_path(pending_id))
             if record["state"] != "armed":
                 return None
-            timestamp = self.now()
-            if timestamp < float(record["deadline_at"]):
+            session_id = record.get("session_id")
+            if not isinstance(session_id, str):
                 return None
-            self._set_state(record, "expired")
-            record["expired_at"] = timestamp
-            self._set_state(record, "transferring")
-            record["claim_reason"] = "expired"
-            record["transferring_at"] = timestamp
-            self._persist(record)
-            return record
+            session_path = self._session_path(session_id)
+            with self._session_locked(session_id):
+                cached = (
+                    self._read_record(session_path)
+                    if session_path.exists()
+                    else None
+                )
+                if not self._same_bound_generation(record, cached):
+                    self._cancel_armed_locally(
+                        record,
+                        "superseded_generation",
+                        cached,
+                    )
+                    return None
+                if self._record_is_prompt_fenced(record, cached):
+                    self._cancel_armed_locally(
+                        record,
+                        "prompt_fenced",
+                        cached,
+                    )
+                    return None
+                timestamp = self.now()
+                if timestamp < float(record["deadline_at"]):
+                    return None
+                self._set_state(record, "expired")
+                record["expired_at"] = timestamp
+                self._set_state(record, "transferring")
+                record["claim_reason"] = "expired"
+                record["transferring_at"] = timestamp
+                self._copy_session_metadata(cached, record)
+                self._write_record(self._pending_path(pending_id), record)
+                self._write_record(session_path, record)
+                return record
 
     def mark_thread_starting(
         self,
@@ -386,7 +455,7 @@ class StateStore:
                         > self._session_record_rank(record)
                     ):
                         continue
-                    self._copy_compaction_metadata(current_cache, record)
+                    self._copy_session_metadata(current_cache, record)
                     self._write_record(path, record)
                     return record
         raise StateAuthorityError("session authority changed repeatedly")
@@ -435,7 +504,7 @@ class StateStore:
                     if session_path.exists()
                     else None
                 )
-                self._copy_compaction_metadata(session_record, record)
+                self._copy_session_metadata(session_record, record)
                 self._write_record(self._pending_path(str(record["pending_id"])), record)
                 if (
                     session_record is None
@@ -463,15 +532,96 @@ class StateStore:
         return maximum
 
     @staticmethod
-    def _copy_compaction_metadata(
+    def _copy_session_metadata(
         source: dict[str, object] | None,
         destination: dict[str, object],
     ) -> None:
         if source is None:
             return
-        for key in ("compaction_count", "compaction_sources"):
+        for key in _SESSION_METADATA_KEYS:
             if key in source:
                 destination[key] = source[key]
+
+    def _allocate_prepare_sequence(self) -> int:
+        with self._prepare_sequence_locked():
+            sequence = self._latest_prepare_sequence_locked() + 1
+            self._write_record(
+                self.prepare_sequence_path,
+                {"latest_prepare_sequence": sequence},
+            )
+            return sequence
+
+    def _latest_prepare_sequence_locked(self) -> int:
+        sequence = 0
+        if self.prepare_sequence_path.exists():
+            metadata = self._read_record(self.prepare_sequence_path)
+            value = metadata.get("latest_prepare_sequence", 0)
+            if isinstance(value, int) and not isinstance(value, bool):
+                sequence = max(sequence, value)
+        for pending_path in self.pending_dir.glob("*.json"):
+            try:
+                self._validate_pending_id(pending_path.stem)
+            except ValueError:
+                continue
+            record = self._read_record(pending_path)
+            value = record.get("prepare_sequence", 0)
+            if isinstance(value, int) and not isinstance(value, bool):
+                sequence = max(sequence, value)
+        return sequence
+
+    def _prepare_sequence_locked(self):
+        return _RecordLock(self.locks_dir / "prepare-sequence.lock")
+
+    def _advance_prompt_fence(
+        self,
+        record: dict[str, object],
+        prepare_sequence: int,
+    ) -> None:
+        generation = record.get("prompt_fence_generation", 0)
+        if not isinstance(generation, int) or isinstance(generation, bool):
+            generation = 0
+        record["prompt_fence_generation"] = generation + 1
+        record["prompt_fence_prepare_sequence"] = prepare_sequence
+        record["prompt_fence_at"] = float(self.now())
+
+    @staticmethod
+    def _prompt_fence_proof(
+        record: dict[str, object],
+        result: str,
+    ) -> dict[str, object]:
+        proof = dict(record)
+        proof["prompt_fence_result"] = result
+        return proof
+
+    def _record_is_prompt_fenced(
+        self,
+        record: dict[str, object],
+        session_record: dict[str, object] | None,
+    ) -> bool:
+        if session_record is None:
+            return False
+        cutoff = session_record.get("prompt_fence_prepare_sequence")
+        if not isinstance(cutoff, int) or isinstance(cutoff, bool):
+            return False
+        sequence = record.get("prepare_sequence", 0)
+        if not isinstance(sequence, int) or isinstance(sequence, bool):
+            sequence = 0
+        return sequence <= cutoff
+
+    def _cancel_armed_locally(
+        self,
+        record: dict[str, object],
+        reason: str,
+        session_record: dict[str, object] | None,
+    ) -> None:
+        self._set_state(record, "cancelled")
+        record["cancelled_at"] = self.now()
+        record["cancel_reason"] = reason
+        self._copy_session_metadata(session_record, record)
+        self._write_record(
+            self._pending_path(str(record["pending_id"])),
+            record,
+        )
 
     @staticmethod
     def _set_state(record: dict[str, object], new_state: str) -> None:

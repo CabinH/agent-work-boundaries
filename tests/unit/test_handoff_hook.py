@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -16,6 +17,7 @@ SCRIPTS_DIR = (
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import handoff_hook
+from state_store import StateStore
 
 
 PENDING_ID = "123e4567-e89b-42d3-a456-426614174000"
@@ -401,6 +403,39 @@ class HandoffHookStopAndPromptTests(unittest.TestCase):
         self.assertLessEqual(len(service.respond_calls), 9)
         self.assertLessEqual(len(service.status_calls), 9)
 
+    def test_prompt_fence_precedes_late_stop_without_racy_status_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = StateStore(Path(temporary_directory), now=lambda: 100.0)
+            delayed = store.prepare(
+                "/repo",
+                "delayed handoff",
+                "/repo/handoff.md",
+            )
+
+            class StoreBackedService:
+                def __init__(self):
+                    self.status_calls = 0
+
+                def respond(self, session_id):
+                    return store.respond(session_id)
+
+                def status(self, session_id):
+                    self.status_calls += 1
+                    raise AssertionError("Hook must use durable prompt proof")
+
+            service = StoreBackedService()
+
+            result = handoff_hook.handle_event(
+                prompt_event(),
+                service,
+                RecordingSpawner(),
+            )
+            late_arm = store.arm(delayed["pending_id"], "thr-old", 300)
+
+        self.assertIsNone(result)
+        self.assertEqual(service.status_calls, 0)
+        self.assertIsNone(late_arm)
+
     def test_user_prompt_guidance_uses_copyable_installed_commands(self):
         service = FakeService(
             {
@@ -470,7 +505,7 @@ class HandoffHookStopAndPromptTests(unittest.TestCase):
                 ),
             },
         )
-        self.assertEqual(service.respond_calls, [])
+        self.assertEqual(service.respond_calls, ["thr-old"])
 
     def test_user_prompt_blocks_transferred_session_without_destination(self):
         service = FakeService(
@@ -492,7 +527,7 @@ class HandoffHookStopAndPromptTests(unittest.TestCase):
         self.assertEqual(result["decision"], "block")
         self.assertIn("do not continue duplicate work", result["reason"])
         self.assertIn("status", result["reason"])
-        self.assertEqual(service.respond_calls, [])
+        self.assertEqual(service.respond_calls, ["thr-old"])
 
     def test_user_prompt_blocks_transfer_in_progress_without_destination(self):
         for state in ("transferring", "expired"):
@@ -516,7 +551,7 @@ class HandoffHookStopAndPromptTests(unittest.TestCase):
                 self.assertEqual(result["decision"], "block")
                 self.assertIn("do not continue duplicate work", result["reason"])
                 self.assertIn("status", result["reason"])
-                self.assertEqual(service.respond_calls, [])
+                self.assertEqual(service.respond_calls, ["thr-old"])
 
     def test_in_progress_block_uses_copyable_installed_status_command(self):
         service = FakeService(
@@ -662,7 +697,7 @@ class HandoffHookStopAndPromptTests(unittest.TestCase):
 
                 self.assertEqual(result["decision"], "block")
                 self.assertIn("status --session-id thr-old", result["reason"])
-                self.assertEqual(service.respond_calls, [])
+                self.assertEqual(service.respond_calls, ["thr-old"])
 
     def test_thread_created_blocks_with_safe_turn_only_resume(self):
         service = FakeService(
@@ -686,7 +721,7 @@ class HandoffHookStopAndPromptTests(unittest.TestCase):
         self.assertIn(f"confirm --pending-id {PENDING_ID}", result["reason"])
         self.assertIn("resume only", result["reason"])
         self.assertIn("status --session-id thr-old", result["reason"])
-        self.assertEqual(service.respond_calls, [])
+        self.assertEqual(service.respond_calls, ["thr-old"])
 
     def test_user_prompt_race_reports_destination_when_transfer_finishes(self):
         class FinishedRaceService(FakeService):
@@ -694,11 +729,6 @@ class HandoffHookStopAndPromptTests(unittest.TestCase):
                 super().__init__()
                 self.statuses = iter(
                     (
-                        {
-                            "pending_id": PENDING_ID,
-                            "session_id": "thr-old",
-                            "state": "armed",
-                        },
                         {
                             "pending_id": PENDING_ID,
                             "session_id": "thr-old",

@@ -247,6 +247,113 @@ class StateStoreTests(unittest.TestCase):
         )
         self.assertEqual(status["pending_id"], generation_two["pending_id"])
 
+    def test_prompt_cancels_newest_generation_and_old_expiry_cannot_claim(self):
+        clock = [100.0]
+        store = StateStore(self.root, now=lambda: clock[0])
+        older = store.prepare("/repo", "older", "/repo/older.md")
+        store.arm(older["pending_id"], "thr-old", 300)
+        newer = store.prepare("/repo", "newer", "/repo/newer.md")
+        newer_armed = store.arm(newer["pending_id"], "thr-old", 300)
+
+        prompt_result = store.respond("thr-old")
+        clock[0] = 400.0
+        stale_claim = store.claim_expired(older["pending_id"])
+
+        self.assertEqual(prompt_result["pending_id"], newer["pending_id"])
+        self.assertEqual(prompt_result["state"], "responded")
+        self.assertEqual(prompt_result["prompt_fence_result"], "responded")
+        self.assertEqual(
+            prompt_result["prompt_fence_prepare_sequence"],
+            newer["prepare_sequence"],
+        )
+        self.assertIsNone(stale_claim)
+        self.assertEqual(
+            self.read_pending(older["pending_id"])["state"],
+            "cancelled",
+        )
+        self.assertEqual(
+            store.get_session_status("thr-old")["pending_id"],
+            newer_armed["pending_id"],
+        )
+        self.assertEqual(store.get_session_status("thr-old")["state"], "responded")
+
+    def test_prompt_without_pending_rejects_delayed_pre_fence_arm_at_equality(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+        delayed = store.prepare("/repo", "delayed", "/repo/delayed.md")
+
+        prompt_result = store.respond("thr-old")
+        armed = store.arm(delayed["pending_id"], "thr-old", 300)
+
+        self.assertEqual(prompt_result["prompt_fence_result"], "observed")
+        self.assertEqual(
+            prompt_result["prompt_fence_prepare_sequence"],
+            delayed["prepare_sequence"],
+        )
+        self.assertIsNone(armed)
+        rejected = self.read_pending(delayed["pending_id"])
+        self.assertEqual(rejected["state"], "cancelled")
+        self.assertEqual(rejected["cancel_reason"], "prompt_fenced")
+        self.assertEqual(
+            rejected["prepare_sequence"],
+            rejected["prompt_fence_prepare_sequence"],
+        )
+
+    def test_prepare_after_prompt_fence_can_arm_and_preserves_session_metadata(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+        store.record_compaction("thr-old", "auto")
+        fenced = store.respond("thr-old")
+
+        later = store.prepare("/repo", "later", "/repo/later.md")
+        armed = store.arm(later["pending_id"], "thr-old", 300)
+
+        self.assertGreater(
+            later["prepare_sequence"],
+            fenced["prompt_fence_prepare_sequence"],
+        )
+        self.assertEqual(armed["state"], "armed")
+        self.assertEqual(armed["generation"], 1)
+        self.assertEqual(armed["compaction_count"], 1)
+        self.assertEqual(armed["compaction_sources"], {"auto": 1})
+        self.assertEqual(
+            armed["prompt_fence_generation"],
+            fenced["prompt_fence_generation"],
+        )
+
+    def test_prompt_and_expiry_at_exact_deadline_have_one_linearized_winner(self):
+        clock = [100.0]
+        store = StateStore(self.root, now=lambda: clock[0])
+        record = store.prepare("/repo", "handoff", "/repo/handoff.md")
+        store.arm(record["pending_id"], "thr-old", 300)
+        clock[0] = 400.0
+
+        prompt_result, expiry_result = self.run_race(
+            lambda: store.respond("thr-old"),
+            lambda: store.claim_expired(record["pending_id"]),
+        )
+        final = store.get_session_status("thr-old")
+
+        if expiry_result is None:
+            self.assertEqual(prompt_result["state"], "responded")
+            self.assertEqual(final["state"], "responded")
+        else:
+            self.assertEqual(expiry_result["state"], "transferring")
+            self.assertEqual(prompt_result["prompt_fence_result"], "observed")
+            self.assertEqual(final["state"], "transferring")
+        self.assertIn(final["state"], {"responded", "transferring"})
+
+    def test_prompt_fence_metadata_is_scalar_bounded_and_monotonic(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+
+        results = [store.respond("thr-old") for _index in range(100)]
+        persisted = self.read_session("thr-old")
+
+        self.assertEqual(results[-1]["prompt_fence_generation"], 100)
+        self.assertEqual(persisted["prompt_fence_generation"], 100)
+        self.assertEqual(persisted["prompt_fence_prepare_sequence"], 0)
+        self.assertIsInstance(persisted["prompt_fence_at"], float)
+        self.assertNotIn("prompt_fences", persisted)
+        self.assertLess(len(json.dumps(persisted)), 300)
+
     def test_status_never_downgrades_cache_when_new_arm_wins_scan_race(self):
         store = StateStore(self.root, now=lambda: 100.0)
         older = store.prepare("/repo", "older", "/repo/older.md")
@@ -366,17 +473,20 @@ class StateStoreTests(unittest.TestCase):
         store.arm(record["pending_id"], "thr-old", timeout_seconds=300)
         clock[0] = 401.0
 
-        results = self.run_race(
+        prompt_result, expiry_result = self.run_race(
             lambda: store.respond("thr-old"),
             lambda: store.claim_expired(record["pending_id"]),
         )
+        final = store.get_session_status("thr-old")
 
-        self.assertEqual(sum(result is not None for result in results), 1)
-        claimed = next(result for result in results if result is not None)
-        self.assertEqual(claimed["state"], "transferring")
-        self.assertEqual(claimed["claim_reason"], "expired")
-        self.assertEqual(self.read_pending(record["pending_id"]), claimed)
-        self.assertEqual(self.read_session("thr-old"), claimed)
+        if expiry_result is None:
+            self.assertEqual(prompt_result["state"], "responded")
+            self.assertEqual(final["state"], "responded")
+        else:
+            self.assertEqual(expiry_result["state"], "transferring")
+            self.assertEqual(expiry_result["claim_reason"], "expired")
+            self.assertEqual(prompt_result["prompt_fence_result"], "observed")
+            self.assertEqual(final["state"], "transferring")
 
     def test_confirm_can_claim_responded_record_once(self):
         store = StateStore(self.root, now=lambda: 100.0)
