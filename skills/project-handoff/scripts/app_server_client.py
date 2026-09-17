@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import json
+import math
 import queue
 import subprocess
 import threading
@@ -51,17 +52,25 @@ class AppServerClient:
         popen_factory=subprocess.Popen,
         request_timeout=10.0,
     ):
+        try:
+            timeout = float(request_timeout)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                "request_timeout must be finite and greater than zero"
+            ) from None
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError(
+                "request_timeout must be finite and greater than zero"
+            )
         self._run_command = run_command
         self._popen_factory = popen_factory
-        self._request_timeout = float(request_timeout)
+        self._request_timeout = timeout
 
     def launch(self, cwd: str, prompt: str) -> LaunchResult:
         self._start_daemon()
         process = self._start_proxy()
         writes = None
-        writer_thread = None
-        stdout_thread = None
-        stderr_thread = None
+        started_threads = []
         try:
             self._validate_proxy_streams(process)
             responses = queue.Queue()
@@ -86,8 +95,11 @@ class AppServerClient:
                 daemon=True,
             )
             writer_thread.start()
+            started_threads.append(writer_thread)
             stdout_thread.start()
+            started_threads.append(stdout_thread)
             stderr_thread.start()
+            started_threads.append(stderr_thread)
 
             self._request(
                 process,
@@ -142,9 +154,7 @@ class AppServerClient:
             self._cleanup_proxy(
                 process,
                 writes,
-                writer_thread,
-                stdout_thread,
-                stderr_thread,
+                started_threads,
             )
 
     def _start_daemon(self):
@@ -295,9 +305,7 @@ class AppServerClient:
         self,
         process,
         writes,
-        writer_thread,
-        stdout_thread,
-        stderr_thread,
+        started_threads,
     ):
         try:
             process.terminate()
@@ -331,6 +339,5 @@ class AppServerClient:
                 pass
         if writes is not None:
             writes.put(None)
-        for thread in (writer_thread, stdout_thread, stderr_thread):
-            if thread is not None:
-                thread.join(timeout=0.1)
+        for thread in started_threads:
+            thread.join(timeout=0.1)

@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import unittest
+from unittest import mock
 
 
 SCRIPTS_DIR = (
@@ -131,6 +132,77 @@ class AppServerClientTests(unittest.TestCase):
         self.assertTrue(process.stderr.was_closed)
         self.assertTrue(process.terminated)
         self.assertTrue(process.waited)
+
+    def test_constructor_rejects_invalid_request_timeouts_before_startup(self):
+        external_calls = []
+
+        def run_command(command, **kwargs):
+            external_calls.append(("daemon", command))
+
+        def popen_factory(command, **kwargs):
+            external_calls.append(("proxy", command))
+
+        for request_timeout in (
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            0,
+            -1,
+        ):
+            with self.subTest(request_timeout=request_timeout):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "request_timeout must be finite and greater than zero",
+                ):
+                    AppServerClient(
+                        run_command=run_command,
+                        popen_factory=popen_factory,
+                        request_timeout=request_timeout,
+                    )
+
+        self.assertEqual(external_calls, [])
+
+    def test_launch_preserves_worker_start_failure_and_cleans_up(self):
+        process = FakeProcess()
+        client = self.make_client(process)
+        start_error = RuntimeError("stdout worker failed to start")
+        created_threads = []
+
+        class ControlledThread:
+            def __init__(self, fail_on_start):
+                self.fail_on_start = fail_on_start
+                self.started = False
+                self.join_calls = 0
+
+            def start(self):
+                if self.fail_on_start:
+                    raise start_error
+                self.started = True
+
+            def join(self, timeout=None):
+                self.join_calls += 1
+                if not self.started:
+                    raise RuntimeError("cannot join thread before it is started")
+
+        def thread_factory(**kwargs):
+            thread = ControlledThread(fail_on_start=len(created_threads) == 1)
+            created_threads.append(thread)
+            return thread
+
+        with mock.patch.object(
+            app_server_client.threading,
+            "Thread",
+            side_effect=thread_factory,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                client.launch("/workspace/repo", "private recovery prompt")
+
+        self.assertIs(raised.exception, start_error)
+        self.assertEqual(len(created_threads), 3)
+        self.assertEqual(created_threads[0].join_calls, 1)
+        self.assertEqual(created_threads[1].join_calls, 0)
+        self.assertEqual(created_threads[2].join_calls, 0)
+        self.assert_proxy_cleaned_up(process)
 
     def test_launch_times_out_when_proxy_stops_consuming_stdin(self):
         process = FakeProcess(
