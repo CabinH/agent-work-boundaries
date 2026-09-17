@@ -10,13 +10,42 @@ import sys
 import time
 
 from app_server_client import AppServerClient
-from handoff_service import HandoffService
+from handoff_service import HandoffService, HandoffValidationError
 from state_store import StateStore
 
 
+class _ParserError(Exception):
+    pass
+
+
+class _HelpRequested(Exception):
+    def __init__(self, help_text):
+        super().__init__()
+        self.help_text = help_text
+
+
+class _CliValidationError(Exception):
+    pass
+
+
 class _ArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._captured_messages = []
+
+    def _print_message(self, message, file=None):
+        if message:
+            self._captured_messages.append(message)
+
+    def exit(self, status=0, message=None):
+        if message:
+            self._print_message(message)
+        if status == 0:
+            raise _HelpRequested("".join(self._captured_messages))
+        raise _ParserError
+
     def error(self, message):
-        raise ValueError(message)
+        raise _ParserError
 
 
 def _parser():
@@ -66,7 +95,7 @@ def _read_draft(path, stdin):
     try:
         return Path(path).read_text(encoding="utf-8")
     except OSError:
-        raise ValueError("unable to read handoff draft") from None
+        raise _CliValidationError("unable to read handoff draft") from None
 
 
 def _run(args, service, stdin):
@@ -109,11 +138,17 @@ def main(argv=None, stdin=None, stdout=None, stderr=None):
         result = _run(args, _build_service(), stdin)
         _write_json(stdout, result if result is not None else {"result": None})
         return 0
-    except ValueError as error:
-        _write_json(stderr, {"error": str(error)})
+    except _HelpRequested as signal:
+        _write_json(stdout, {"help": signal.help_text})
+        return 0
+    except _ParserError:
+        _write_json(stdout, {"error": "invalid arguments"})
+        return 2
+    except (HandoffValidationError, _CliValidationError) as error:
+        _write_json(stdout, {"error": str(error)})
         return 2
     except Exception:
-        _write_json(stderr, {"error": "command failed"})
+        _write_json(stdout, {"error": "command failed"})
         return 1
 
 

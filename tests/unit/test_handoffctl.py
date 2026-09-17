@@ -48,10 +48,9 @@ class HandoffCtlTests(unittest.TestCase):
         ):
             exit_code = handoffctl.main(list(argv), io.StringIO(), stdout, stderr)
         stdout_lines = stdout.getvalue().splitlines()
-        stderr_lines = stderr.getvalue().splitlines()
-        self.assertLessEqual(len(stdout_lines) + len(stderr_lines), 1)
-        output = stdout_lines or stderr_lines
-        payload = json.loads(output[0]) if output else None
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(len(stdout_lines), 1)
+        payload = json.loads(stdout_lines[0])
         return exit_code, payload, stdout.getvalue(), stderr.getvalue()
 
     def prepare(self, name="draft.md"):
@@ -191,8 +190,8 @@ class HandoffCtlTests(unittest.TestCase):
 
         self.assertNotEqual(code, 0)
         self.assertEqual(payload, {"error": "invalid pending id"})
-        self.assertEqual(stdout, "")
-        self.assertNotIn("Traceback", stderr)
+        self.assertTrue(stdout.endswith("\n"))
+        self.assertEqual(stderr, "")
 
     def test_malformed_draft_returns_one_clean_json_error(self):
         draft = self.root / "malformed.md"
@@ -210,8 +209,8 @@ class HandoffCtlTests(unittest.TestCase):
 
         self.assertNotEqual(code, 0)
         self.assertEqual(payload, {"error": "handoff is missing required sections"})
-        self.assertEqual(stdout, "")
-        self.assertNotIn("Traceback", stderr)
+        self.assertTrue(stdout.endswith("\n"))
+        self.assertEqual(stderr, "")
 
     def test_unexpected_failure_does_not_expose_exception_secret(self):
         class SecretFailingService:
@@ -227,9 +226,43 @@ class HandoffCtlTests(unittest.TestCase):
 
         self.assertNotEqual(code, 0)
         self.assertEqual(payload, {"error": "command failed"})
-        self.assertEqual(stdout, "")
+        self.assertTrue(stdout.endswith("\n"))
         self.assertNotIn("private-token-value", stderr)
-        self.assertNotIn("Traceback", stderr)
+        self.assertEqual(stderr, "")
+
+    def test_unexpected_value_error_does_not_expose_exception_secret(self):
+        class SecretFailingService:
+            def status(self, session_id):
+                raise ValueError("Bearer private-value-error-token")
+
+        code, payload, stdout, stderr = self.invoke(
+            "status",
+            "--session-id",
+            "thr-old",
+            service=SecretFailingService(),
+        )
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(payload, {"error": "command failed"})
+        self.assertTrue(stdout.endswith("\n"))
+        self.assertEqual(stderr, "")
+
+    def test_parser_error_is_one_json_object_on_stdout(self):
+        code, payload, stdout, stderr = self.invoke()
+
+        self.assertEqual(code, 2)
+        self.assertEqual(payload, {"error": "invalid arguments"})
+        self.assertTrue(stdout.endswith("\n"))
+        self.assertEqual(stderr, "")
+
+    def test_help_is_one_json_object_without_system_exit(self):
+        code, payload, stdout, stderr = self.invoke("--help")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(set(payload), {"help"})
+        self.assertIn("prepare", payload["help"])
+        self.assertTrue(stdout.endswith("\n"))
+        self.assertEqual(stderr, "")
 
 
 if __name__ == "__main__":

@@ -1,3 +1,5 @@
+import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -42,6 +44,23 @@ class FailingClient(RecordingClient):
     def launch(self, cwd: str, prompt: str) -> LaunchResult:
         self.calls.append((cwd, prompt))
         raise RuntimeError("launch failed: " + "x" * 2_000)
+
+
+class FileRecordingClient:
+    def __init__(self, path):
+        self.path = path
+
+    def launch(self, cwd: str, prompt: str) -> LaunchResult:
+        descriptor = os.open(
+            self.path,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o600,
+        )
+        try:
+            os.write(descriptor, b"launch\n")
+        finally:
+            os.close(descriptor)
+        return LaunchResult(thread_id="thr-new", turn_id="turn-new")
 
 
 class FakeClock:
@@ -102,6 +121,68 @@ class HandoffServiceTests(unittest.TestCase):
         self.assertEqual(result["new_thread_id"], "thr-new")
         self.assertEqual(len(client.calls), 1)
 
+    def test_project_publish_replaces_within_verified_parent_descriptor(self):
+        service, _client, _clock = self.make_service()
+        pending_id, target = self.prepare_armed(service)
+        real_replace = os.replace
+        project_replaces = []
+
+        def record_replace(source, destination, *args, **kwargs):
+            if "dst_dir_fd" in kwargs:
+                project_replaces.append((source, destination, dict(kwargs)))
+            return real_replace(source, destination, *args, **kwargs)
+
+        with mock.patch("handoff_service.os.replace", side_effect=record_replace):
+            service.confirm(pending_id)
+
+        self.assertEqual(len(project_replaces), 1)
+        source, destination, options = project_replaces[0]
+        self.assertNotIn(os.sep, source)
+        self.assertEqual(destination, "AI-HANDOFF.md")
+        self.assertEqual(options["src_dir_fd"], options["dst_dir_fd"])
+        self.assertEqual(target.read_text(), VALID_HANDOFF)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+        self.assertEqual(target.parent.stat().st_mode & 0o022, 0)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
+    def test_confirm_is_single_winner_across_processes(self):
+        service, _client, clock = self.make_service()
+        pending_id, target = self.prepare_armed(service)
+        marker = self.root / "launches.log"
+        read_fd, write_fd = os.pipe()
+        children = []
+
+        for _index in range(2):
+            process_id = os.fork()
+            if process_id == 0:
+                try:
+                    os.close(write_fd)
+                    os.read(read_fd, 1)
+                    child_service = HandoffService(
+                        store=StateStore(
+                            self.root / "state",
+                            now=clock.now,
+                        ),
+                        app_server_client=FileRecordingClient(marker),
+                        private_handoff_dir=self.root / "private",
+                        sleeper=clock.sleep,
+                    )
+                    child_service.confirm(pending_id)
+                except BaseException:
+                    os._exit(1)
+                os._exit(0)
+            children.append(process_id)
+
+        os.close(read_fd)
+        os.write(write_fd, b"xx")
+        os.close(write_fd)
+        statuses = [os.waitpid(process_id, 0)[1] for process_id in children]
+
+        self.assertEqual(statuses, [0, 0])
+        self.assertEqual(marker.read_text().splitlines(), ["launch"])
+        self.assertEqual(service.status("thr-old")["state"], "transferred")
+        self.assertEqual(target.read_text(), VALID_HANDOFF)
+
     def test_wait_exits_without_transfer_after_response(self):
         service, client, clock = self.make_service()
         pending_id, target = self.prepare_armed(service)
@@ -127,6 +208,65 @@ class HandoffServiceTests(unittest.TestCase):
         self.assertEqual(result["claim_reason"], "expired")
         self.assertEqual(target.read_text(), VALID_HANDOFF)
         self.assertEqual(len(client.calls), 1)
+
+    def test_wait_rechecks_after_early_wake_and_backward_clock_shift(self):
+        service, client, clock = self.make_service()
+        pending_id, target = self.prepare_armed(service)
+        wake_times = iter((150.0, 50.0, 400.0))
+
+        def irregular_sleep(seconds):
+            clock.sleeps.append(seconds)
+            clock.value = next(wake_times)
+
+        service.sleeper = irregular_sleep
+
+        result = service.wait_and_expire(pending_id)
+
+        self.assertEqual(clock.sleeps, [300.0, 250.0, 350.0])
+        self.assertEqual(result["state"], "transferred")
+        self.assertEqual(target.read_text(), VALID_HANDOFF)
+        self.assertEqual(len(client.calls), 1)
+
+    def test_wait_stops_after_response_or_cancel_during_early_wake(self):
+        for action in ("respond", "cancel"):
+            with self.subTest(action=action):
+                case_root = self.root / action
+                clock = FakeClock()
+                client = RecordingClient()
+                service = HandoffService(
+                    store=StateStore(case_root / "state", now=clock.now),
+                    app_server_client=client,
+                    private_handoff_dir=case_root / "private",
+                    sleeper=None,
+                )
+                target = case_root / "docs" / "AI-HANDOFF.md"
+                pending_id = service.prepare(case_root, VALID_HANDOFF, target)
+                service.arm(pending_id, "thr-old", 300)
+
+                def interrupt(seconds):
+                    clock.sleeps.append(seconds)
+                    clock.value = 150.0
+                    if action == "respond":
+                        service.respond("thr-old")
+                    else:
+                        service.cancel(pending_id)
+
+                service.sleeper = interrupt
+
+                result = service.wait_and_expire(pending_id)
+
+                self.assertIsNone(result)
+                self.assertEqual(clock.sleeps, [300.0])
+                expected_state = {
+                    "respond": "responded",
+                    "cancel": "cancelled",
+                }[action]
+                self.assertEqual(
+                    service.status("thr-old")["state"],
+                    expected_state,
+                )
+                self.assertFalse(target.exists())
+                self.assertEqual(client.calls, [])
 
     def test_confirm_and_timeout_create_only_one_thread(self):
         service, client, clock = self.make_service()
@@ -176,10 +316,13 @@ class HandoffServiceTests(unittest.TestCase):
         pending_id, target = self.prepare_armed(service)
         real_replace = __import__("os").replace
 
-        def deny_project_write(source, destination):
-            if Path(destination) == target:
+        def deny_project_write(source, destination, *args, **kwargs):
+            is_project_publish = Path(destination) == target or (
+                destination == target.name and "dst_dir_fd" in kwargs
+            )
+            if is_project_publish:
                 raise PermissionError("project is read-only")
-            return real_replace(source, destination)
+            return real_replace(source, destination, *args, **kwargs)
 
         with mock.patch("handoff_service.os.replace", side_effect=deny_project_write):
             result = service.confirm(pending_id)
@@ -189,6 +332,11 @@ class HandoffServiceTests(unittest.TestCase):
         self.assertFalse(target.exists())
         self.assertEqual(private_copy.read_text(), VALID_HANDOFF)
         self.assertIn(str(private_copy), client.calls[0][1])
+        self.assertEqual(
+            stat.S_IMODE(service.private_handoff_dir.stat().st_mode),
+            0o700,
+        )
+        self.assertEqual(stat.S_IMODE(private_copy.stat().st_mode), 0o600)
 
     def test_target_path_rejects_directory_traversal(self):
         service, client, _clock = self.make_service()
@@ -217,6 +365,107 @@ class HandoffServiceTests(unittest.TestCase):
         )
         self.assertEqual(client.calls, [])
 
+    def test_absolute_target_outside_cwd_is_rejected(self):
+        service, client, _clock = self.make_service()
+
+        with tempfile.TemporaryDirectory() as outside_name:
+            outside = Path(outside_name) / "AI-HANDOFF.md"
+            with self.assertRaisesRegex(ValueError, "beneath cwd"):
+                service.prepare(self.root, VALID_HANDOFF, outside)
+
+            self.assertFalse(outside.exists())
+        self.assertEqual(client.calls, [])
+
+    def test_existing_outside_parent_symlink_uses_private_fallback(self):
+        service, client, _clock = self.make_service()
+        with tempfile.TemporaryDirectory() as outside_name:
+            outside = Path(outside_name)
+            (self.root / "docs").symlink_to(outside, target_is_directory=True)
+            pending_id = service.prepare(
+                self.root,
+                VALID_HANDOFF,
+                "docs/AI-HANDOFF.md",
+            )
+            service.arm(pending_id, "thr-old", 300)
+
+            result = service.confirm(pending_id)
+
+            self.assertFalse((outside / "AI-HANDOFF.md").exists())
+            self.assertEqual(result["state"], "transferred")
+            self.assertEqual(
+                (self.root / "private" / f"{pending_id}.md").read_text(),
+                VALID_HANDOFF,
+            )
+            self.assertIn(
+                str(self.root / "private" / f"{pending_id}.md"),
+                client.calls[0][1],
+            )
+        self.assertEqual(len(client.calls), 1)
+
+    def test_in_tree_project_parent_symlink_uses_private_fallback(self):
+        service, client, _clock = self.make_service()
+        actual_parent = self.root / "actual-docs"
+        actual_parent.mkdir()
+        (self.root / "docs").symlink_to(
+            actual_parent,
+            target_is_directory=True,
+        )
+        pending_id = service.prepare(
+            self.root,
+            VALID_HANDOFF,
+            "docs/AI-HANDOFF.md",
+        )
+        service.arm(pending_id, "thr-old", 300)
+
+        result = service.confirm(pending_id)
+
+        private_copy = self.root / "private" / f"{pending_id}.md"
+        self.assertEqual(result["state"], "transferred")
+        self.assertFalse((actual_parent / "AI-HANDOFF.md").exists())
+        self.assertEqual(private_copy.read_text(), VALID_HANDOFF)
+        self.assertIn(str(private_copy), client.calls[0][1])
+
+    def test_parent_symlink_substitution_cannot_redirect_publication(self):
+        service, client, _clock = self.make_service()
+        target = self.root / "docs" / "AI-HANDOFF.md"
+        pending_id = service.prepare(self.root, VALID_HANDOFF, target)
+        service.arm(pending_id, "thr-old", 300)
+        target.parent.mkdir()
+        displaced = self.root / "verified-docs"
+        real_replace = os.replace
+
+        with tempfile.TemporaryDirectory() as outside_name:
+            outside = Path(outside_name)
+            substituted = False
+
+            def substitute_parent(source, destination, *args, **kwargs):
+                nonlocal substituted
+                is_project_publish = Path(destination) == target or (
+                    destination == target.name and "dst_dir_fd" in kwargs
+                )
+                if not substituted and is_project_publish:
+                    substituted = True
+                    target.parent.rename(displaced)
+                    if "src_dir_fd" not in kwargs:
+                        real_replace(
+                            displaced / Path(source).name,
+                            outside / Path(source).name,
+                        )
+                    target.parent.symlink_to(outside, target_is_directory=True)
+                return real_replace(source, destination, *args, **kwargs)
+
+            with mock.patch(
+                "handoff_service.os.replace",
+                side_effect=substitute_parent,
+            ):
+                result = service.confirm(pending_id)
+
+            private_copy = self.root / "private" / f"{pending_id}.md"
+            self.assertEqual(result["state"], "transferred")
+            self.assertFalse((outside / target.name).exists())
+            self.assertEqual(private_copy.read_text(), VALID_HANDOFF)
+            self.assertIn(str(private_copy), client.calls[0][1])
+
     def test_prepare_rejects_section_names_without_required_headings(self):
         service, client, _clock = self.make_service()
         malformed = VALID_HANDOFF.replace("# Completed Work", "## Completed Work")
@@ -227,6 +476,30 @@ class HandoffServiceTests(unittest.TestCase):
                 malformed,
                 self.root / "docs" / "AI-HANDOFF.md",
             )
+
+        self.assertEqual(client.calls, [])
+
+    def test_prepare_ignores_required_headings_inside_markdown_code(self):
+        service, client, _clock = self.make_service()
+        disguised_headings = {
+            "backtick fence": "```text\n# Completed Work\n```",
+            "tilde fence": "~~~\n# Completed Work\n~~~",
+            "four-space code": "    # Completed Work",
+            "tab-indented code": "\t# Completed Work",
+        }
+
+        for label, disguised in disguised_headings.items():
+            with self.subTest(label=label):
+                malformed = VALID_HANDOFF.replace("# Completed Work", disguised)
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "missing required sections",
+                ):
+                    service.prepare(
+                        self.root,
+                        malformed,
+                        self.root / "docs" / "AI-HANDOFF.md",
+                    )
 
         self.assertEqual(client.calls, [])
 
