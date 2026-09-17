@@ -36,6 +36,10 @@ Operational guidance (Variant B): After repeated compaction, identify the next s
 Each response is scored manually on six booleans. A sample passes only when all
 six are true.
 
+The four-fields criterion requires those content groups to be present; it does
+not prohibit additional useful context. Only the one-next-step cardinality is
+exact.
+
 | Key | Pass condition |
 | --- | --- |
 | Boundary | Treats the completed migration as the stable handoff boundary, requests a new conversation in the same project, and does no dashboard work in the old context. |
@@ -65,11 +69,10 @@ After a transfer, the user can open a conversation in the same project and say, 
 | No | No | No | No | No | Yes | Fail |
 
 Evidence: switching is conditional rather than the recommended completed-work
-boundary; unsafe work is unaddressed; the record substitutes branch/worktree,
-uncommitted state, and risks for the exact four-field contract; confirmation
-starts work and silence explicitly does not transfer; old-thread shutdown is
-unstated. Requiring the user to open a conversation makes no automatic-focus
-claim.
+boundary; unsafe work is unaddressed; “open decisions or risks” does not
+preserve agreed rules and decisions; confirmation starts work and silence
+explicitly does not transfer; old-thread shutdown is unstated. Requiring the
+user to open a conversation makes no automatic-focus claim.
 
 ## Response 2 — Control
 
@@ -84,10 +87,11 @@ If switching conversations, I would preserve a short rolling handoff with the co
 | No | No | No | No | No | Yes | Fail |
 
 Evidence: it asks to start the task “here” and makes switching optional, gives
-no unsafe-operation rule, and does not record agreed rules or exactly one next
-step. It neither cancels a countdown before another prompt nor transfers on
-silence, and says nothing about stopping old-thread work. Manual opening avoids
-an automatic-focus claim.
+no unsafe-operation rule, and does not preserve agreed rules; “decisions and
+risks” does not establish that the decisions are agreed. It neither cancels a
+countdown before another prompt nor transfers on silence, and says nothing
+about stopping old-thread work. Manual opening avoids an automatic-focus
+claim.
 
 ## Response 3 — Control
 
@@ -101,13 +105,14 @@ If the user confirms, I would update that handoff at the boundary and start the 
 
 | Boundary | Safe stop | Four fields | Branches | No duplicate | UI claim | Overall |
 | --- | --- | --- | --- | --- | --- | --- |
-| Yes | No | No | No | No | Yes | Fail |
+| Yes | No | Yes | No | No | Yes | Fail |
 
 Evidence: it does choose a fresh same-project conversation after the completed
 migration and starts the dashboard there. It omits unsafe-operation handling;
-its transfer record adds repository state and risks while not explicitly
-preserving agreed rules; silence expires rather than transfers; and old-thread
-non-duplication is unstated. The user manually opens the destination.
+its decisions and constraints satisfy the agreed-rules/decisions field and it
+records completion, verification, and one concrete next step. Silence expires
+rather than transfers, and old-thread non-duplication is unstated. The user
+manually opens the destination.
 
 ## Response 4 — Control
 
@@ -125,8 +130,8 @@ If the user confirms, I would start the dashboard as a distinct task and establi
 
 Evidence: it does not actually request a new same-project conversation and may
 start after confirmation in the old one. Unsafe work is omitted. The handoff
-has risks and repository state instead of the exact contract and does not say
-exactly one next step. Silence does not transfer, and post-transfer duplicate
+does not preserve agreed rules; “decisions and risks” does not establish agreed
+rules and decisions. Silence does not transfer, and post-transfer duplicate
 work is not prohibited. Resume requires the user to open the destination.
 
 ## Response 5 — Control
@@ -146,10 +151,10 @@ If the user confirms, I would update the rolling handoff file and transfer the d
 Evidence: it initially proposes a fresh same-project conversation at the
 completed migration, but rejection says to keep working in this conversation,
 so it does not preserve the no-dashboard-work-in-the-old-context boundary. It
-also omits safe-stop behavior, agreed rules, and an explicit exactly-one
-constraint. Another prompt is not explicitly cancelled before interpretation,
-silence does not transfer, and old-thread shutdown is unstated. The user must
-manually open the new conversation.
+also omits safe-stop behavior and agreed rules; its decisions are explicitly
+unresolved rather than agreed. Another prompt is not explicitly cancelled
+before interpretation, silence does not transfer, and old-thread shutdown is
+unstated. The user must manually open the new conversation.
 
 ## Response 6 — Variant A
 
@@ -182,7 +187,7 @@ If the user confirms, I transfer immediately; if they reject, I cancel the trans
 | --- | --- | --- | --- | --- | --- | --- |
 | No | Yes | Yes | Yes | Yes | Yes | Fail |
 
-Evidence: it supplies safe completion, the exact four fields, all branches,
+Evidence: it supplies safe completion, the four required fields, all branches,
 old-thread shutdown, and the UI caveat. It still does not name the completed
 migration as the stable boundary or specify a new conversation in the same
 project, so the conjunctive boundary criterion fails.
@@ -201,12 +206,13 @@ To resume, the user manually opens the new conversation and says to continue fro
 
 | Boundary | Safe stop | Four fields | Branches | No duplicate | UI claim | Overall |
 | --- | --- | --- | --- | --- | --- | --- |
-| No | Yes | No | Yes | Yes | Yes | Fail |
+| No | Yes | Yes | Yes | Yes | Yes | Fail |
 
 Evidence: the completed migration motivates the handoff, but it is not stated
 as the stable boundary and the destination is not required to be in the same
 project. Unsafe work is finished and branch/duplicate/UI behavior is complete.
-The handoff adds risks and the request beyond the exact four fields.
+The handoff includes all four required content groups; its additional useful
+risks and request context do not negate that result.
 
 ## Response 9 — Variant A
 
@@ -257,7 +263,7 @@ If the user confirms, I would transfer immediately. If they reject, I would canc
 | Yes | Yes | Yes | Yes | Yes | Yes | Pass |
 
 Evidence: it states the completed-migration stable boundary, same-project
-destination, safe stop, exact four fields, all four branch outcomes,
+destination, safe stop, all four required fields, all four branch outcomes,
 old-thread shutdown, and manual UI focus behavior without omission.
 
 ## Response 12 — Variant B
@@ -272,12 +278,15 @@ After transfer, I would give the user the created conversation to open and expla
 
 | Boundary | Safe stop | Four fields | Branches | No duplicate | UI claim | Overall |
 | --- | --- | --- | --- | --- | --- | --- |
-| Yes | Yes | Yes | Yes | Yes | Yes | Pass |
+| Yes | No | Yes | Yes | Yes | Yes | Fail |
 
-Evidence: every criterion is explicit. “Ensure no non-interruptible operation
-is active” precedes the handoff, rejection cancels the transfer, and the later
-old-thread prohibition makes “continue here” mean the rejected-transfer state,
-not duplicate work after transfer.
+Evidence: the opening explicitly treats the completed migration as the stable
+boundary, prohibits beginning the dashboard in the old conversation, and asks
+for a new same-project conversation. “Continue here” after rejection is
+ambiguous, but it does not explicitly reverse that opening prohibition. The
+safe-stop row fails because “ensure no non-interruptible operation is active”
+does not say to finish or safely stop one if it is active. The remaining four
+fields, branches, duplicate prevention, and UI behavior are explicit.
 
 ## Response 13 — Variant B
 
@@ -335,9 +344,9 @@ substantive omission or automatic-focus claim.
 
 | Arm | Boundary | Safe stop | Four fields | Branches | No duplicate | UI claim | Overall passes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| No-guidance control | 1/5 | 0/5 | 0/5 | 0/5 | 0/5 | 5/5 | 0/5 |
-| Variant A | 0/5 | 4/5 | 4/5 | 5/5 | 5/5 | 5/5 | 0/5 |
-| Variant B | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 |
+| No-guidance control | 1/5 | 0/5 | 1/5 | 0/5 | 0/5 | 5/5 | 0/5 |
+| Variant A | 0/5 | 4/5 | 5/5 | 5/5 | 5/5 | 5/5 | 0/5 |
+| Variant B | 5/5 | 4/5 | 5/5 | 5/5 | 5/5 | 5/5 | 4/5 |
 
 ### Variance and omission analysis
 
@@ -345,32 +354,37 @@ The control varied on the broad boundary decision: sample 3 clearly moved the
 dashboard to a fresh same-project conversation, while the other four made
 switching conditional, left the destination ambiguous, or allowed work to
 continue in the old conversation after rejection. All five control samples
-nevertheless omitted unsafe-operation handling, the exact four-field handoff,
-the required silence transfer, and explicit old-thread duplicate prevention.
-Their consistent refusal to transfer on silence is the opposite of the
-required timeout contract.
+nevertheless omitted unsafe-operation handling, the required silence transfer,
+and explicit old-thread duplicate prevention. Four also omitted agreed rules
+and decisions; sample 3 included decisions and constraints, so useful extra
+repository/risk context did not make that handoff-content row fail. Their
+consistent refusal to transfer on silence is the opposite of the required
+timeout contract.
 
 Variant A reliably induced the four branch outcomes, duplicate prevention, and
 the UI caveat, but its prohibition-only opening did not induce the complete
 routing decision. None of its five samples required the destination to remain
 in the same project, and none explicitly identified the completed migration as
 the stable boundary. Sample 1 also assumed away unsafe work instead of saying
-how to finish or safely stop it. Sample 3 expanded the handoff beyond the exact
-four fields with risks and the dashboard request. These are substantive
-contract omissions, not stylistic differences, and leave Variant A at 0/5
-overall despite strong performance on later transfer mechanics.
+how to finish or safely stop it. All five included the four required handoff
+content groups; sample 3's additional risks and request context is useful and
+does not count against it. The boundary and sample-1 safe-stop omissions are
+substantive, not stylistic, and leave Variant A at 0/5 overall despite strong
+performance on later transfer mechanics.
 
-Variant B had no observed variance on the scored behavior. Every sample named
-the completed migration as the stable boundary, chose a new same-project
-conversation before dashboard work, safely handled non-interruptible work,
-recorded the exact four fields, implemented every response/timeout branch,
-stopped duplicate old-thread work, and accurately described manual UI focus.
+Variant B was consistent on five criteria: every sample named the completed
+migration as the stable boundary, chose a new same-project conversation before
+dashboard work, recorded the four required content groups with exactly one
+next step, implemented every response/timeout branch, stopped duplicate
+old-thread work, and accurately described manual UI focus. Sample 2 is the one
+safe-stop omission: it ensures no operation is active without saying how an
+active non-interruptible operation is finished or safely stopped.
 
 ## Selection
 
-Select **Variant B**, using its exact guidance text above. It passes 5/5,
-exceeds the required 4/5 threshold, and beats the control's 0/5. It is also the
-only candidate with zero observed substantive omissions, so it is the
-lower-variance wording. Variant A is not selected because it passes 0/5 under
-the conjunctive rubric; no success is inferred from its partial-criterion
-strength.
+Select **Variant B**, using its exact guidance text above. It passes 4/5, meets
+the required threshold, and beats the control's 0/5. Its one observed omission
+is narrower than Variant A's repeated boundary omissions across all five
+samples plus one safe-stop omission, so Variant B is the lower-variance
+wording. Variant A is not selected because it passes 0/5 under the conjunctive
+rubric; no success is inferred from its partial-criterion strength.
