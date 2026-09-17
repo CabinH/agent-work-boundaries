@@ -21,10 +21,10 @@ The controller supplied four response files produced by four isolated evaluator 
 | --- | --- | --- |
 | A: independent research | Pass | Selects a read-only child task and supplies the required input constraints, concise evidence-backed return, uncertainty, and recommendation. |
 | B: coupled product decision | Pass | Keeps the unresolved public-API choice at the user decision boundary and does not delegate or guess. |
-| C: parallel code changes | Partial | Correctly separates package-local write scopes and gives one integration owner exclusive, serialized control of the shared configuration, but does not explicitly isolate the independent Git write tasks in separate worktrees. |
+| C: parallel code changes | Pass | Correctly separates package-local write scopes, expressly prohibits package workers from editing the shared configuration, and gives one integration owner exclusive control after both package tasks complete. |
 | D: thread and project boundaries | Fail | Keeps the parser in place, but substitutes a separate project workstream for the required same-project documentation thread and a secure thread/workspace for the required new finance project; it also never explicitly explains why child Agents cannot own these long-lived deliverables. |
 
-Scenario D is a genuine material RED result. The baseline therefore required no pressure-enhanced rerun. Scenario C's missing worktree isolation is recorded as a boundary weakness, not inflated into an unsafe-shared-write failure: the response does correctly prevent concurrent edits to the shared file.
+Scenario D is the sole genuine material RED result. The baseline therefore required no pressure-enhanced rerun.
 
 ## Scenario A — Pass
 
@@ -58,11 +58,9 @@ Delegation contract: Not applicable until the decision is made. Afterward, deleg
 Expected return shape: A concise decision record containing the chosen policy (`immediate` or `30-day delayed`), the resulting public API contract, acceptance criteria for observable behavior, and any migration or backward-compatibility requirements. That record becomes the input to implementation delegation.
 ```
 
-## Scenario C — Partial
+## Scenario C — Pass
 
-**Exact boundary weakness:** The response assigns the package tasks to separate agents with disjoint file scopes, but it never says those independent Git-backed write tasks run in separate worktrees. This leaves filesystem and branch isolation implicit. The omission weakens the execution boundary, while the core shared-state rule still passes: package workers are expressly forbidden to edit the shared configuration, and one integration owner edits it only after both package changes are available.
-
-**No stated rationalization for the omission:** The evaluator gives no reason for omitting worktrees. The exact boundary it chose was, “Delegate the two package-local tasks independently, one agent per package,” so this is scored as a missing operational safeguard rather than an invented unsafe-sharing rationale.
+**Manual PASS evidence:** The response assigns the independent package tasks disjoint write scopes, expressly prohibits both package workers from editing the shared configuration, and gives one integration owner sole authority to edit it only after both package changes are available. This satisfies every mandatory condition; the rubric permits separate worktrees but does not require the response to name them.
 
 ### Evaluator response (verbatim)
 
@@ -139,4 +137,4 @@ Expected return shape
 
 ## Result
 
-The no-Skill control is RED: Scenario D materially fails both required long-lived routing boundaries and the child-substitute explanation. Scenario C also exposes a narrower operational-isolation weakness, while preserving the essential single-owner/serialized shared-file rule. Scenarios A and B pass. No tightened-pressure rerun is required.
+The no-Skill control is RED: Scenario D materially fails both required long-lived routing boundaries and the child-substitute explanation. Scenarios A, B, and C pass. No tightened-pressure rerun is required.
