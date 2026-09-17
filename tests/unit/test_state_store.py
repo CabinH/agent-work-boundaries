@@ -402,6 +402,83 @@ class StateStoreTests(unittest.TestCase):
         claimed = store.claim_confirm(record["pending_id"])
         self.assertEqual(claimed["state"], "thread_created")
 
+    def test_new_thread_attempt_clears_prior_unsent_metadata(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+        record = store.prepare("/repo", "handoff", "/repo/AI-HANDOFF.md")
+        store.arm(record["pending_id"], "thr-old", timeout_seconds=300)
+        store.claim_confirm(record["pending_id"])
+        store.mark_thread_starting(record["pending_id"], "old prompt")
+        store.mark_thread_unsent_failed(
+            record["pending_id"],
+            error_summary="old definitely-unsent failure",
+            recovery_prompt="old prompt",
+        )
+        store.claim_confirm(record["pending_id"])
+
+        retrying = store.mark_thread_starting(
+            record["pending_id"],
+            recovery_prompt="new prompt",
+        )
+
+        self.assertEqual(retrying["state"], "thread_starting")
+        self.assertEqual(retrying["recovery_prompt"], "new prompt")
+        self.assertNotIn("request_outcome", retrying)
+        self.assertNotIn("error_summary", retrying)
+        self.assertNotIn("failed_at", retrying)
+        self.assertEqual(
+            retrying["request_history"][-1]["outcome"],
+            "definitely_unsent",
+        )
+
+        ambiguous = store.mark_indeterminate(
+            record["pending_id"],
+            error_summary="new ambiguous failure",
+            recovery_prompt="new prompt",
+        )
+        self.assertEqual(ambiguous["request_outcome"], "possibly_sent")
+        self.assertEqual(ambiguous["error_summary"], "new ambiguous failure")
+
+    def test_new_turn_attempt_clears_prior_unsent_metadata(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+        record = store.prepare("/repo", "handoff", "/repo/AI-HANDOFF.md")
+        store.arm(record["pending_id"], "thr-old", timeout_seconds=300)
+        store.claim_confirm(record["pending_id"])
+        store.mark_thread_starting(record["pending_id"], "resume prompt")
+        store.mark_thread_created(record["pending_id"], "thr-new")
+        store.mark_turn_starting(
+            record["pending_id"],
+            client_user_message_id=f'project-handoff:{record["pending_id"]}',
+        )
+        store.mark_turn_unsent(
+            record["pending_id"],
+            error_summary="old definitely-unsent turn failure",
+            recovery_prompt="resume prompt",
+        )
+
+        retrying = store.mark_turn_starting(
+            record["pending_id"],
+            client_user_message_id=f'project-handoff:{record["pending_id"]}',
+        )
+
+        self.assertEqual(retrying["state"], "turn_starting")
+        self.assertEqual(retrying["new_thread_id"], "thr-new")
+        self.assertEqual(retrying["recovery_prompt"], "resume prompt")
+        self.assertNotIn("request_outcome", retrying)
+        self.assertNotIn("error_summary", retrying)
+        self.assertNotIn("turn_unsent_at", retrying)
+        self.assertEqual(
+            retrying["request_history"][-1]["outcome"],
+            "definitely_unsent",
+        )
+
+        ambiguous = store.mark_indeterminate(
+            record["pending_id"],
+            error_summary="new ambiguous turn failure",
+            recovery_prompt="resume prompt",
+        )
+        self.assertEqual(ambiguous["request_outcome"], "possibly_sent")
+        self.assertEqual(ambiguous["new_thread_id"], "thr-new")
+
     def test_invalid_pending_id_is_rejected(self):
         store = StateStore(self.root, now=lambda: 100.0)
 

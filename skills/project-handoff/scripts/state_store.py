@@ -27,6 +27,16 @@ LEGAL_TRANSITIONS = {
     "cancelled": set(),
 }
 
+_ATTEMPT_DIAGNOSTIC_KEYS = (
+    "request_outcome",
+    "error_summary",
+    "failed_at",
+    "turn_unsent_at",
+    "external_phase",
+    "indeterminate_at",
+)
+_REQUEST_HISTORY_LIMIT = 20
+
 
 class StateStore:
     """Persist handoff state beneath a caller-supplied private directory."""
@@ -138,6 +148,7 @@ class StateStore:
             if record["state"] != "transferring":
                 return None
             self._set_state(record, "thread_starting")
+            self._clear_attempt_diagnostics(record)
             record["recovery_prompt"] = recovery_prompt
             record["thread_starting_at"] = self.now()
             self._persist(record)
@@ -168,6 +179,7 @@ class StateStore:
             if record["state"] != "thread_created":
                 return None
             self._set_state(record, "turn_starting")
+            self._clear_attempt_diagnostics(record)
             record["client_user_message_id"] = client_user_message_id
             record["turn_starting_at"] = self.now()
             self._persist(record)
@@ -202,6 +214,7 @@ class StateStore:
             if state not in {"thread_starting", "turn_starting"}:
                 return None
             self._set_state(record, "indeterminate")
+            record["request_outcome"] = "possibly_sent"
             record["external_phase"] = state
             record["error_summary"] = error_summary
             record["recovery_prompt"] = recovery_prompt
@@ -220,10 +233,18 @@ class StateStore:
             if record["state"] != "thread_starting":
                 return None
             self._set_state(record, "failed")
+            timestamp = self.now()
+            self._append_request_history(
+                record,
+                phase="thread_start",
+                outcome="definitely_unsent",
+                error_summary=error_summary,
+                recorded_at=timestamp,
+            )
             record["request_outcome"] = "definitely_unsent"
             record["error_summary"] = error_summary
             record["recovery_prompt"] = recovery_prompt
-            record["failed_at"] = self.now()
+            record["failed_at"] = timestamp
             self._persist(record)
             return record
 
@@ -238,10 +259,18 @@ class StateStore:
             if record["state"] != "turn_starting":
                 return None
             self._set_state(record, "thread_created")
+            timestamp = self.now()
+            self._append_request_history(
+                record,
+                phase="turn_start",
+                outcome="definitely_unsent",
+                error_summary=error_summary,
+                recorded_at=timestamp,
+            )
             record["request_outcome"] = "definitely_unsent"
             record["error_summary"] = error_summary
             record["recovery_prompt"] = recovery_prompt
-            record["turn_unsent_at"] = self.now()
+            record["turn_unsent_at"] = timestamp
             self._persist(record)
             return record
 
@@ -363,6 +392,31 @@ class StateStore:
         if new_state not in LEGAL_TRANSITIONS[state]:
             raise ValueError(f"illegal state transition: {state} -> {new_state}")
         record["state"] = new_state
+
+    @staticmethod
+    def _clear_attempt_diagnostics(record: dict[str, object]) -> None:
+        for key in _ATTEMPT_DIAGNOSTIC_KEYS:
+            record.pop(key, None)
+
+    @staticmethod
+    def _append_request_history(
+        record: dict[str, object],
+        phase: str,
+        outcome: str,
+        error_summary: str,
+        recorded_at: float,
+    ) -> None:
+        existing = record.get("request_history")
+        history = list(existing) if isinstance(existing, list) else []
+        history.append(
+            {
+                "phase": phase,
+                "outcome": outcome,
+                "error_summary": error_summary,
+                "recorded_at": recorded_at,
+            }
+        )
+        record["request_history"] = history[-_REQUEST_HISTORY_LIMIT:]
 
     @staticmethod
     def _session_record_rank(record: dict[str, object]) -> tuple[bool, float, str]:

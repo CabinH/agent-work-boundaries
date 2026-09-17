@@ -320,7 +320,6 @@ class AppServerClient:
         except Exception:
             raise AppServerError(
                 f"{method} could not be queued",
-                request_may_have_been_sent=False,
             ) from None
         try:
             error = completion.get(timeout=remaining)

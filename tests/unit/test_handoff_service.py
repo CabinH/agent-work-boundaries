@@ -164,6 +164,16 @@ class UnknownTurnFailureClient(RecordingClient):
         raise RuntimeError("unknown turn failure")
 
 
+class EnqueueThenRaiseThreadClient(RecordingClient):
+    def start_thread(self, cwd: str, before_send):
+        before_send()
+        self.thread_calls.append(cwd)
+        raise AppServerError(
+            "queue raised after inserting thread/start",
+            request_may_have_been_sent=True,
+        )
+
+
 class FailTurnBeforeSendOnceClient(RecordingClient):
     def __init__(self):
         super().__init__()
@@ -717,6 +727,22 @@ class HandoffServiceTests(unittest.TestCase):
                 self.assertEqual(status["state"], "indeterminate")
                 self.assertEqual(status["external_phase"], external_phase)
                 self.assertFalse(status["retryable"])
+
+    def test_enqueue_then_raise_remains_indeterminate_and_non_reclaimable(self):
+        service, client, _clock = self.make_service(
+            client=EnqueueThenRaiseThreadClient()
+        )
+        pending_id, _target = self.prepare_armed(service)
+
+        with self.assertRaisesRegex(AppServerError, "after inserting"):
+            service.confirm(pending_id)
+
+        status = service.status("thr-old")
+        self.assertEqual(status["state"], "indeterminate")
+        self.assertEqual(status["request_outcome"], "possibly_sent")
+        self.assertFalse(status["retryable"])
+        self.assertIsNone(service.confirm(pending_id))
+        self.assertEqual(client.thread_calls, [str(self.root)])
 
     def test_thread_id_persistence_failure_keeps_non_reclaimable_phase(self):
         service, client, _clock = self.make_service()

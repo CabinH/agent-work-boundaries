@@ -63,6 +63,23 @@ class FailingInput(RecordingInput):
         return super().write(value)
 
 
+class EnqueueThenRaiseQueue(queue.Queue):
+    def __init__(self, target_method):
+        super().__init__()
+        self.target_method = target_method
+        self.inserted_target = False
+
+    def put(self, item, *args, **kwargs):
+        super().put(item, *args, **kwargs)
+        if item is None:
+            return
+        payload, _completion = item
+        message = json.loads(payload)
+        if message.get("method") == self.target_method:
+            self.inserted_target = True
+            raise RuntimeError("queue raised after insertion")
+
+
 class TrackedStringIO(io.StringIO):
     def __init__(self, value=""):
         super().__init__(value)
@@ -488,44 +505,101 @@ class AppServerClientTests(unittest.TestCase):
                 self.assertTrue(outcome[0].request_may_have_been_sent)
                 self.assert_proxy_cleaned_up(process)
 
-    def test_pre_queue_deadline_and_queue_failures_are_definitely_unsent(self):
-        cases = (
-            (
-                "deadline",
-                queue.Queue(),
-                11.0,
-            ),
-            (
-                "queue",
-                mock.Mock(
-                    put=mock.Mock(side_effect=RuntimeError("queue closed"))
-                ),
-                9.0,
-            ),
+    def test_pre_put_deadline_failure_is_definitely_unsent(self):
+        writes = queue.Queue()
+        with mock.patch.object(
+            app_server_client.time,
+            "monotonic",
+            return_value=11.0,
+        ):
+            with self.assertRaises(app_server_client.AppServerError) as raised:
+                AppServerClient._send(
+                    writes,
+                    {
+                        "id": 2,
+                        "method": "thread/start",
+                        "params": {"cwd": "/workspace/repo"},
+                    },
+                    deadline=10.0,
+                )
+
+        self.assertFalse(raised.exception.request_may_have_been_sent)
+        self.assertTrue(writes.empty())
+
+    def test_queue_insertion_exception_is_conservatively_sent(self):
+        writes = mock.Mock(
+            put=mock.Mock(side_effect=RuntimeError("queue outcome unknown"))
         )
 
-        for label, writes, now in cases:
-            with self.subTest(failure=label), mock.patch.object(
-                app_server_client.time,
-                "monotonic",
-                return_value=now,
-            ):
-                with self.assertRaises(
-                    app_server_client.AppServerError
-                ) as raised:
-                    AppServerClient._send(
-                        writes,
-                        {
-                            "id": 2,
-                            "method": "thread/start",
-                            "params": {"cwd": "/workspace/repo"},
-                        },
-                        deadline=10.0,
-                    )
+        with self.assertRaises(app_server_client.AppServerError) as raised:
+            AppServerClient._send(
+                writes,
+                {
+                    "id": 2,
+                    "method": "thread/start",
+                    "params": {"cwd": "/workspace/repo"},
+                },
+                deadline=app_server_client.time.monotonic() + 1.0,
+            )
 
-            self.assertFalse(raised.exception.request_may_have_been_sent)
-            if label == "deadline":
-                self.assertTrue(writes.empty())
+        self.assertTrue(raised.exception.request_may_have_been_sent)
+
+    def test_enqueue_then_raise_is_conservatively_sent(self):
+        operations = (
+            (
+                "thread/start",
+                {"id": 2, "result": {"thread": {"id": "thr-new"}}},
+                lambda client: client.start_thread(
+                    "/workspace/repo",
+                    before_send=lambda: None,
+                ),
+            ),
+            (
+                "turn/start",
+                {"id": 2, "result": {"turn": {"id": "turn-new"}}},
+                lambda client: client.start_turn(
+                    "thr-new",
+                    "resume from the handoff",
+                    "project-handoff:pending-123",
+                    before_send=lambda: None,
+                ),
+            ),
+        )
+        real_queue = queue.Queue
+
+        for target_method, target_response, operation in operations:
+            with self.subTest(method=target_method):
+                process = FakeProcess(
+                    [
+                        {"id": 1, "result": {"capabilities": {}}},
+                        target_response,
+                    ]
+                )
+                writes = EnqueueThenRaiseQueue(target_method)
+                queue_count = 0
+
+                def queue_factory(*args, **kwargs):
+                    nonlocal queue_count
+                    queue_count += 1
+                    if queue_count == 2:
+                        return writes
+                    return real_queue(*args, **kwargs)
+
+                with mock.patch.object(
+                    app_server_client.queue,
+                    "Queue",
+                    side_effect=queue_factory,
+                ):
+                    with self.assertRaises(
+                        app_server_client.AppServerError
+                    ) as raised:
+                        operation(self.make_client(process))
+
+                self.assertTrue(writes.inserted_target)
+                self.assertTrue(
+                    raised.exception.request_may_have_been_sent
+                )
+                self.assert_proxy_cleaned_up(process)
 
     def test_target_writer_error_is_conservatively_sent(self):
         process = FakeProcess(
