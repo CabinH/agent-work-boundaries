@@ -6,6 +6,7 @@ import os
 import shutil
 import stat
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -143,13 +144,13 @@ class InstallerTests(unittest.TestCase):
             )
             self.assertFalse((codex_home / "skills" / "task-router").exists())
 
-    def test_cli_malformed_hooks_returns_nonzero_without_mutation(self):
+    def test_cli_malformed_hooks_returns_nonzero_without_target_mutation(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             codex_home = Path(temp_dir) / "codex-home"
             codex_home.mkdir()
             hooks_path = codex_home / "hooks.json"
             hooks_path.write_text('{"hooks":', encoding="utf-8")
-            before = _tree_snapshot(codex_home)
+            hooks_before = hooks_path.read_bytes()
 
             exit_code, stdout, stderr = _invoke_main(
                 ["--codex-home", str(codex_home)]
@@ -160,7 +161,11 @@ class InstallerTests(unittest.TestCase):
             error = json.loads(stderr)
             self.assertEqual(error["action"], "install")
             self.assertIn("cannot read hooks file", error["error"])
-            self.assertEqual(_tree_snapshot(codex_home), before)
+            self.assertEqual(hooks_path.read_bytes(), hooks_before)
+            self.assertFalse((codex_home / "skills").exists())
+            lock = codex_home / ".agent-work-boundaries.lock"
+            self.assertTrue(lock.is_file())
+            self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
 
     def test_cli_defaults_to_codex_home_environment_variable(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -730,7 +735,15 @@ class InstallerTests(unittest.TestCase):
                                 dry_run=dry_run,
                             )
 
-                    self.assertEqual(tuple(codex_home.iterdir()), entries_before)
+                    if dry_run:
+                        self.assertEqual(
+                            tuple(codex_home.iterdir()), entries_before
+                        )
+                    else:
+                        self.assertEqual(
+                            sorted(path.name for path in codex_home.iterdir()),
+                            [".agent-work-boundaries.lock", "hooks.json"],
+                        )
                     self.assertTrue(stat.S_ISFIFO(hooks_path.lstat().st_mode))
 
     def test_install_rejects_source_tree_symlink_without_creating_home(self):
@@ -1444,6 +1457,108 @@ class InstallerTests(unittest.TestCase):
 
             self.assertEqual(_tree_snapshot(codex_home), before)
 
+    def test_empty_home_uninstall_contends_on_the_bundle_lock(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / "codex-home"
+            codex_home.mkdir()
+            lock_path = codex_home / ".agent-work-boundaries.lock"
+            lock_path.touch(mode=0o600)
+            descriptor = os.open(lock_path, os.O_RDWR)
+            before = _tree_snapshot(codex_home)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaisesRegex(InstallError, "another .* operation"):
+                    installer_module.uninstall_bundle(
+                        codex_home, dry_run=False
+                    )
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+
+            self.assertEqual(_tree_snapshot(codex_home), before)
+
+    def test_uninstall_contends_during_first_install_before_journal_exists(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / "codex-home"
+            repo_root = Path(__file__).resolve().parents[2]
+            entered_stage = threading.Event()
+            release_stage = threading.Event()
+            install_errors: list[BaseException] = []
+            real_stage_skill = installer_module._stage_skill
+
+            def block_first_stage(*args, **kwargs):
+                if not entered_stage.is_set():
+                    entered_stage.set()
+                    if not release_stage.wait(timeout=5):
+                        raise AssertionError("test did not release first install")
+                return real_stage_skill(*args, **kwargs)
+
+            def run_install():
+                try:
+                    install_bundle(repo_root, codex_home, dry_run=False)
+                except BaseException as error:
+                    install_errors.append(error)
+
+            with patch.object(
+                installer_module, "_stage_skill", side_effect=block_first_stage
+            ):
+                worker = threading.Thread(target=run_install)
+                worker.start()
+                self.assertTrue(entered_stage.wait(timeout=5))
+                self.assertFalse(
+                    (
+                        codex_home
+                        / ".agent-work-boundaries.transaction.json"
+                    ).exists()
+                )
+                try:
+                    with self.assertRaisesRegex(
+                        InstallError, "another .* operation"
+                    ):
+                        installer_module.uninstall_bundle(
+                            codex_home, dry_run=False
+                        )
+                finally:
+                    release_stage.set()
+                    worker.join(timeout=10)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(install_errors, [])
+            self.assertTrue(
+                (codex_home / "skills" / "project-handoff" / "SKILL.md").is_file()
+            )
+
+    def test_missing_home_non_dry_uninstall_bootstraps_shared_lock_only(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / "missing-codex-home"
+
+            report = installer_module.uninstall_bundle(
+                codex_home, dry_run=False
+            )
+
+            lock_path = codex_home / ".agent-work-boundaries.lock"
+            self.assertEqual(report.action, "uninstall")
+            self.assertEqual(report.changed_paths, ())
+            self.assertTrue(lock_path.is_file())
+            metadata = lock_path.stat()
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+            self.assertEqual(metadata.st_nlink, 1)
+            self.assertEqual(
+                sorted(path.name for path in codex_home.iterdir()),
+                [".agent-work-boundaries.lock"],
+            )
+
+    def test_missing_home_uninstall_dry_run_creates_nothing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / "missing-codex-home"
+
+            report = installer_module.uninstall_bundle(
+                codex_home, dry_run=True
+            )
+
+            self.assertTrue(report.dry_run)
+            self.assertFalse(codex_home.exists())
+
     def test_dry_run_creates_neither_lock_nor_journal_in_existing_home(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             codex_home = Path(temp_dir) / "codex-home"
@@ -1533,6 +1648,72 @@ class InstallerTests(unittest.TestCase):
                             for path in codex_home.rglob("*")
                         )
                     )
+
+    def test_interrupted_install_recovers_before_invalid_source_is_planned(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            source_root = temp_root / "source"
+            shutil.copytree(
+                Path(__file__).resolve().parents[2] / "skills",
+                source_root / "skills",
+            )
+            codex_home = temp_root / "codex-home"
+            install_bundle(source_root, codex_home, dry_run=False)
+            marker = (
+                codex_home / "skills" / "project-handoff" / "original.txt"
+            )
+            marker.write_text("restore before validation\n", encoding="utf-8")
+            router_marker = codex_home / "skills" / "task-router" / "original.txt"
+            router_marker.write_text("router original\n", encoding="utf-8")
+            expected_hooks = (codex_home / "hooks.json").read_bytes()
+            real_replace = installer_module._replace_and_fsync
+            crashed = False
+
+            def crash_after_first_retire(source, target):
+                nonlocal crashed
+                result = real_replace(source, target)
+                target_path = Path(target)
+                if (
+                    not crashed
+                    and target_path.parent == codex_home / "skills"
+                    and ".retired-" in target_path.name
+                ):
+                    crashed = True
+                    raise SystemExit("simulated interrupted install")
+                return result
+
+            with patch.object(
+                installer_module,
+                "_replace_and_fsync",
+                side_effect=crash_after_first_retire,
+            ):
+                with self.assertRaisesRegex(SystemExit, "interrupted install"):
+                    install_bundle(source_root, codex_home, dry_run=False)
+
+            journal = codex_home / ".agent-work-boundaries.transaction.json"
+            self.assertTrue(journal.is_file())
+            shutil.rmtree(source_root / "skills" / "project-handoff")
+
+            with self.assertRaisesRegex(InstallError, "missing skill source"):
+                install_bundle(source_root, codex_home, dry_run=False)
+
+            self.assertTrue(crashed)
+            self.assertEqual(
+                marker.read_text(encoding="utf-8"),
+                "restore before validation\n",
+            )
+            self.assertEqual(
+                router_marker.read_text(encoding="utf-8"),
+                "router original\n",
+            )
+            self.assertEqual((codex_home / "hooks.json").read_bytes(), expected_hooks)
+            self.assertFalse(journal.exists())
+            self.assertFalse(
+                any(
+                    ".retired-" in path.name or ".stage-" in path.name
+                    for path in codex_home.rglob("*")
+                )
+            )
 
     def test_first_install_crashes_after_each_replace_and_next_run_recovers(self):
         repo_root = Path(__file__).resolve().parents[2]
@@ -1819,6 +2000,103 @@ class InstallerTests(unittest.TestCase):
 
                     self.assertEqual(_tree_snapshot(codex_home), before)
                     self.assertEqual(outside.read_text(), "do not touch\n")
+
+    def test_non_private_control_files_are_rejected_before_use(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        for control_name, operation in (
+            (
+                ".agent-work-boundaries.lock",
+                lambda home: install_bundle(repo_root, home, dry_run=False),
+            ),
+            (
+                ".agent-work-boundaries.transaction.json",
+                lambda home: installer_module.uninstall_bundle(
+                    home, dry_run=False
+                ),
+            ),
+        ):
+            with self.subTest(control_name=control_name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    codex_home = Path(temp_dir) / "codex-home"
+                    codex_home.mkdir()
+                    control = codex_home / control_name
+                    control.write_text("{}\n", encoding="utf-8")
+                    control.chmod(0o644)
+                    before = _tree_snapshot(codex_home)
+
+                    with self.assertRaisesRegex(
+                        InstallError, "permissions must be private"
+                    ):
+                        operation(codex_home)
+
+                    self.assertEqual(_tree_snapshot(codex_home), before)
+
+    def test_hard_linked_control_files_are_rejected_before_use(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        for control_name, operation in (
+            (
+                ".agent-work-boundaries.lock",
+                lambda home: install_bundle(repo_root, home, dry_run=False),
+            ),
+            (
+                ".agent-work-boundaries.transaction.json",
+                lambda home: installer_module.uninstall_bundle(
+                    home, dry_run=False
+                ),
+            ),
+        ):
+            with self.subTest(control_name=control_name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    codex_home = temp_root / "codex-home"
+                    codex_home.mkdir()
+                    control = codex_home / control_name
+                    control.write_text("{}\n", encoding="utf-8")
+                    control.chmod(0o600)
+                    alias = temp_root / f"alias-{control_name.lstrip('.')}"
+                    os.link(control, alias)
+                    before = _tree_snapshot(codex_home)
+
+                    with self.assertRaisesRegex(InstallError, "hard links"):
+                        operation(codex_home)
+
+                    self.assertEqual(_tree_snapshot(codex_home), before)
+                    self.assertEqual(alias.read_text(encoding="utf-8"), "{}\n")
+
+    def test_created_lock_and_crash_journal_are_private_single_link_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / "codex-home"
+            repo_root = Path(__file__).resolve().parents[2]
+            real_replace = installer_module._replace_and_fsync
+
+            def crash_after_first_target(source, target):
+                result = real_replace(source, target)
+                target_path = Path(target)
+                journal = codex_home / ".agent-work-boundaries.transaction.json"
+                if (
+                    journal.exists()
+                    and target_path.parent == codex_home / "skills"
+                    and target_path.name == "project-handoff"
+                ):
+                    raise SystemExit("leave journal for mode inspection")
+                return result
+
+            with patch.object(
+                installer_module,
+                "_replace_and_fsync",
+                side_effect=crash_after_first_target,
+            ):
+                with self.assertRaisesRegex(SystemExit, "mode inspection"):
+                    install_bundle(repo_root, codex_home, dry_run=False)
+
+            for control in (
+                codex_home / ".agent-work-boundaries.lock",
+                codex_home / ".agent-work-boundaries.transaction.json",
+            ):
+                with self.subTest(control=control.name):
+                    metadata = control.stat()
+                    self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+                    self.assertEqual(metadata.st_nlink, 1)
 
     def test_directory_fsync_failure_rolls_back_and_clears_journal(self):
         with tempfile.TemporaryDirectory() as temp_dir:

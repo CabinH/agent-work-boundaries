@@ -540,10 +540,23 @@ def _make_directory(path: Path) -> None:
     if current_mode is None or not stat.S_ISDIR(current_mode):
         raise InstallError(f"expected a directory: {current}")
     for directory in reversed(missing):
-        directory.mkdir(mode=0o700)
-        directory.chmod(0o700)
-        _fsync_directory(directory)
-        _fsync_directory(directory.parent)
+        created = False
+        try:
+            directory.mkdir(mode=0o700)
+            created = True
+        except FileExistsError:
+            pass
+        directory_mode = _lstat_mode(directory)
+        if directory_mode is None or not stat.S_ISDIR(directory_mode):
+            if directory_mode is not None and stat.S_ISLNK(directory_mode):
+                raise InstallError(
+                    f"directory creation encountered a symbolic link: {directory}"
+                )
+            raise InstallError(f"expected a directory: {directory}")
+        if created:
+            directory.chmod(0o700)
+            _fsync_directory(directory)
+            _fsync_directory(directory.parent)
     path_mode = _lstat_mode(path)
     if path_mode is None or not stat.S_ISDIR(path_mode):
         raise InstallError(f"expected a directory: {path}")
@@ -793,10 +806,7 @@ def _copy_path_durable(source: Path, destination: Path) -> None:
 def _installation_plan(
     source_root: Path, codex_home: Path
 ) -> tuple[dict[str, Path], dict[str, Path], Path, dict[str, Any]]:
-    sources = {name: source_root / "skills" / name for name in _SKILL_NAMES}
-    for source in sources.values():
-        _validate_source_tree(source)
-
+    sources = _validate_install_sources(source_root)
     skills_dir = codex_home / "skills"
     targets = {name: skills_dir / name for name in _SKILL_NAMES}
     _validate_managed_paths(codex_home, targets)
@@ -810,6 +820,26 @@ def _installation_plan(
     except ValueError as error:
         raise InstallError(f"cannot merge hooks file {hooks_path}: {error}") from error
     return sources, targets, hooks_path, merged_hooks
+
+
+def _validate_install_sources(source_root: Path) -> dict[str, Path]:
+    sources = {name: source_root / "skills" / name for name in _SKILL_NAMES}
+    for source in sources.values():
+        _validate_source_tree(source)
+    return sources
+
+
+def _validate_home_and_controls_for_lock(codex_home: Path) -> None:
+    _assert_no_symlink_components(codex_home, "CODEX_HOME path")
+    home_mode = _lstat_mode(codex_home)
+    if home_mode is not None and not stat.S_ISDIR(home_mode):
+        raise InstallError(f"expected a directory: {codex_home}")
+    _validate_private_control_entry(
+        codex_home / _LOCK_NAME, "bundle lock file"
+    )
+    _validate_private_control_entry(
+        codex_home / _JOURNAL_NAME, "transaction journal"
+    )
 
 
 def _uninstallation_plan(
@@ -1378,12 +1408,14 @@ def install_bundle(
 
     source_root = Path(source_root).absolute()
     codex_home = Path(codex_home).absolute()
-    sources, targets, hooks_path, merged_hooks = _installation_plan(
-        source_root, codex_home
-    )
-    changed_paths = tuple([*targets.values(), hooks_path])
-    planned_root, planned_files = _planned_backup(codex_home, targets, hooks_path)
     if dry_run:
+        sources, targets, hooks_path, merged_hooks = _installation_plan(
+            source_root, codex_home
+        )
+        changed_paths = tuple([*targets.values(), hooks_path])
+        planned_root, planned_files = _planned_backup(
+            codex_home, targets, hooks_path
+        )
         if _path_exists(_journal_path(codex_home)):
             _read_journal(codex_home)
             raise InstallError(
@@ -1397,13 +1429,17 @@ def install_bundle(
             dry_run=True,
         )
 
+    if not _path_exists(codex_home):
+        _validate_install_sources(source_root)
+    _validate_home_and_controls_for_lock(codex_home)
     _make_directory(codex_home)
     with _bundle_lock(codex_home):
         _recover_unfinished_transaction(codex_home)
-        _make_directory(codex_home / "skills")
         sources, targets, hooks_path, merged_hooks = _installation_plan(
             source_root, codex_home
         )
+        _make_directory(codex_home / "skills")
+        changed_paths = tuple([*targets.values(), hooks_path])
         document, backed_up_files = _prepare_transaction(
             action="install",
             codex_home=codex_home,
@@ -1443,24 +1479,28 @@ def uninstall_bundle(codex_home: Path, dry_run: bool) -> InstallReport:
     """Remove only bundle-managed skills and hooks, preserving handoff state."""
 
     codex_home = Path(codex_home).absolute()
-    (
-        targets,
-        hooks_path,
-        remaining_hooks,
-        hooks_changed,
-        changed_paths,
-    ) = _uninstallation_plan(codex_home)
-    needs_backup = bool(changed_paths)
-    planned_root = _next_backup_root(codex_home) if needs_backup else None
-    if planned_root is None:
-        planned_files: tuple[Path, ...] = ()
-    else:
-        _, planned_files = _planned_backup_from_root(
-            planned_root,
-            targets,
-            hooks_path if hooks_changed else codex_home / ".absent-hooks",
-        )
     if dry_run:
+        (
+            targets,
+            hooks_path,
+            remaining_hooks,
+            hooks_changed,
+            changed_paths,
+        ) = _uninstallation_plan(codex_home)
+        needs_backup = bool(changed_paths)
+        planned_root = _next_backup_root(codex_home) if needs_backup else None
+        if planned_root is None:
+            planned_files: tuple[Path, ...] = ()
+        else:
+            _, planned_files = _planned_backup_from_root(
+                planned_root,
+                targets,
+                (
+                    hooks_path
+                    if hooks_changed
+                    else codex_home / ".absent-hooks"
+                ),
+            )
         if _path_exists(_journal_path(codex_home)):
             _read_journal(codex_home)
             raise InstallError(
@@ -1474,15 +1514,7 @@ def uninstall_bundle(codex_home: Path, dry_run: bool) -> InstallReport:
             dry_run=dry_run,
         )
 
-    if not needs_backup and not _path_exists(_journal_path(codex_home)):
-        return InstallReport(
-            action="uninstall",
-            changed_paths=changed_paths,
-            backed_up_files=(),
-            backup_root=None,
-            dry_run=False,
-        )
-
+    _validate_home_and_controls_for_lock(codex_home)
     _make_directory(codex_home)
     with _bundle_lock(codex_home):
         _recover_unfinished_transaction(codex_home)

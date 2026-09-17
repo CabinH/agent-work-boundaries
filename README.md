@@ -39,6 +39,11 @@ without changing either Skill or `hooks.json`; retry it after the first command
 finishes. A dry run creates neither the Codex home, the lock, nor a recovery
 journal.
 
+To share that same lock with a concurrently starting first install, a non-dry
+uninstall against a missing Codex home creates the home and persistent lock,
+then reports an empty change set. It creates no Skills, Hooks, journal, or
+backup. Use `--dry-run` when even that lock bootstrap is unwanted.
+
 Before changing an installed target, the installer fsyncs its staged files and
 timestamped backups, then records an identifier-only private transaction
 journal. If a process or machine stops mid-operation, rerun the same non-dry-run
