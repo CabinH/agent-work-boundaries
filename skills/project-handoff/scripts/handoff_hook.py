@@ -96,22 +96,36 @@ def _handle_stop(payload, service, spawn_worker):
                 f"{confirm_command}; to remain here, run {cancel_command}."
             )
         else:
-            status_command = _control_command(
-                "status",
-                "--session-id",
-                session_id,
-            )
             if (
                 isinstance(disabled, dict)
                 and disabled.get("state") == "cancelled"
             ):
-                outcome = "automatic transfer was cancelled"
+                status_command = _control_command(
+                    "status",
+                    "--session-id",
+                    session_id,
+                )
+                message = (
+                    "The handoff timer did not start and automatic transfer "
+                    f"was cancelled. Run {status_command} for the current "
+                    "state and recovery details."
+                )
             else:
-                outcome = "automatic transfer state needs review"
-            message = (
-                f"The handoff timer did not start and {outcome}. Run "
-                f"{status_command} for the current state and recovery details."
-            )
+                confirm_command = _control_command(
+                    "confirm",
+                    "--pending-id",
+                    pending_id,
+                )
+                cancel_command = _control_command(
+                    "cancel",
+                    "--pending-id",
+                    pending_id,
+                )
+                message = (
+                    "The automatic timer is not running, and the handoff "
+                    "state could not be changed automatically. To transfer, "
+                    f"run {confirm_command}; to disarm, run {cancel_command}."
+                )
         return {
             "systemMessage": message
         }

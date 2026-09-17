@@ -904,6 +904,65 @@ class HandoffHookSafetyAndMainTests(unittest.TestCase):
         self.assertNotIn("private-worker-token", warning)
         self.assertLess(len(warning.split()), 120)
 
+    def test_spawn_and_both_rollback_failures_return_actionable_warning(self):
+        class RollbackFailingService(FakeService):
+            def respond(self, session_id):
+                self.respond_calls.append(session_id)
+                raise RuntimeError("Bearer private-respond-token")
+
+            def cancel(self, pending_id):
+                self.cancel_calls.append(pending_id)
+                raise RuntimeError("Bearer private-cancel-token")
+
+        service = RollbackFailingService()
+        marker = f"<!-- project-handoff:pending={PENDING_ID} -->"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with mock.patch.object(
+            handoff_hook,
+            "HANDOFFCTL_PATH",
+            QUOTED_HANDOFFCTL,
+        ), mock.patch.object(
+            handoff_hook.sys,
+            "executable",
+            QUOTED_PYTHON,
+        ):
+            code = handoff_hook.main(
+                stdin=io.StringIO(json.dumps(stop_event(marker))),
+                stdout=stdout,
+                stderr=stderr,
+                service=service,
+                spawn_worker=FailingSpawner(),
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(service.records["thr-old"]["state"], "armed")
+        self.assertEqual(service.respond_calls, ["thr-old"])
+        self.assertEqual(service.cancel_calls, [PENDING_ID])
+        warning = json.loads(stdout.getvalue())["systemMessage"]
+        self.assertIn("automatic timer is not running", warning)
+        self.assertIn(
+            "'/opt/Codex Python/bin/python3' "
+            "'/installed/project handoff/scripts/handoffctl.py' "
+            f"confirm --pending-id {PENDING_ID}",
+            warning,
+        )
+        self.assertIn(
+            "'/opt/Codex Python/bin/python3' "
+            "'/installed/project handoff/scripts/handoffctl.py' "
+            f"cancel --pending-id {PENDING_ID}",
+            warning,
+        )
+        for secret in (
+            "private-worker-token",
+            "private-respond-token",
+            "private-cancel-token",
+        ):
+            self.assertNotIn(secret, warning)
+        self.assertLess(len(warning.split()), 120)
+        self.assertEqual(stderr.getvalue(), "")
+
     def test_malformed_and_unknown_events_have_no_effect(self):
         malformed = (
             None,
