@@ -322,7 +322,61 @@ def remove_managed_hooks(existing: dict[str, Any]) -> dict[str, Any]:
 
 
 def _path_exists(path: Path) -> bool:
-    return path.exists() or path.is_symlink()
+    return _lstat_mode(path) is not None
+
+
+def _lstat_mode(path: Path) -> int | None:
+    try:
+        return path.lstat().st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+
+
+def _mode_description(mode: int) -> str:
+    if stat.S_ISLNK(mode):
+        return "a symbolic link"
+    if stat.S_ISFIFO(mode):
+        return "a FIFO"
+    if stat.S_ISSOCK(mode):
+        return "a socket"
+    if stat.S_ISCHR(mode):
+        return "a character device"
+    if stat.S_ISBLK(mode):
+        return "a block device"
+    return "an unsupported file type"
+
+
+def _tree_entries(root: Path, label: str) -> list[tuple[Path, int]]:
+    entries: list[tuple[Path, int]] = []
+    directories = [root]
+    while directories:
+        directory = directories.pop()
+        try:
+            with os.scandir(directory) as children:
+                for child in children:
+                    path = Path(child.path)
+                    try:
+                        mode = child.stat(follow_symlinks=False).st_mode
+                    except OSError as error:
+                        raise InstallError(
+                            f"cannot inspect {label} entry {path}: {error}"
+                        ) from error
+                    entries.append((path, mode))
+                    if stat.S_ISDIR(mode):
+                        directories.append(path)
+        except OSError as error:
+            raise InstallError(
+                f"cannot inspect {label} {directory}: {error}"
+            ) from error
+    return entries
+
+
+def _validate_regular_tree(root: Path, label: str) -> None:
+    for path, mode in _tree_entries(root, label):
+        if not stat.S_ISDIR(mode) and not stat.S_ISREG(mode):
+            raise InstallError(
+                f"{label} contains {_mode_description(mode)}: {path}"
+            )
 
 
 def _assert_no_symlink_components(path: Path, label: str) -> None:
@@ -330,22 +384,45 @@ def _assert_no_symlink_components(path: Path, label: str) -> None:
     current = Path(absolute.anchor)
     for part in absolute.parts[1:]:
         current /= part
-        if current.is_symlink():
+        mode = _lstat_mode(current)
+        if mode is None:
+            break
+        if stat.S_ISLNK(mode):
             raise InstallError(f"{label} contains a symbolic link: {current}")
+        if current != absolute and not stat.S_ISDIR(mode):
+            raise InstallError(f"expected a directory: {current}")
 
 
 def _validate_source_tree(source: Path) -> None:
     _assert_no_symlink_components(source, "skill source path")
-    if not source.is_dir():
+    mode = _lstat_mode(source)
+    if mode is None:
         raise InstallError(f"missing skill source: {source}")
-    for path in source.rglob("*"):
-        if path.is_symlink():
-            raise InstallError(f"skill source contains a symbolic link: {path}")
+    if not stat.S_ISDIR(mode):
+        if stat.S_ISLNK(mode):
+            raise InstallError(f"skill source contains a symbolic link: {source}")
+        raise InstallError(f"skill source must be a directory: {source}")
+    _validate_regular_tree(source, "skill source")
 
 
-def _validate_managed_paths(codex_home: Path) -> None:
+def _validate_managed_target(name: str, target: Path) -> None:
+    mode = _lstat_mode(target)
+    if mode is None or stat.S_ISREG(mode):
+        return
+    if not stat.S_ISDIR(mode):
+        raise InstallError(
+            f"managed skill target {name} contains "
+            f"{_mode_description(mode)}: {target}"
+        )
+    _validate_regular_tree(target, f"managed skill target {name}")
+
+
+def _validate_managed_paths(
+    codex_home: Path, targets: dict[str, Path]
+) -> None:
     _assert_no_symlink_components(codex_home, "CODEX_HOME path")
-    if _path_exists(codex_home) and not codex_home.is_dir():
+    home_mode = _lstat_mode(codex_home)
+    if home_mode is not None and not stat.S_ISDIR(home_mode):
         raise InstallError(f"expected a directory: {codex_home}")
     for path, label in (
         (codex_home / "skills", "skills directory"),
@@ -355,13 +432,23 @@ def _validate_managed_paths(codex_home: Path) -> None:
             "bundle backup directory",
         ),
     ):
-        if path.is_symlink():
+        mode = _lstat_mode(path)
+        if mode is None:
+            continue
+        if stat.S_ISLNK(mode):
             raise InstallError(f"{label} is a symbolic link: {path}")
-        if path.exists() and not path.is_dir():
+        if not stat.S_ISDIR(mode):
             raise InstallError(f"expected a directory: {path}")
+    for name, target in targets.items():
+        _validate_managed_target(name, target)
     hooks_path = codex_home / "hooks.json"
-    if hooks_path.is_symlink():
+    hooks_mode = _lstat_mode(hooks_path)
+    if hooks_mode is None:
+        return
+    if stat.S_ISLNK(hooks_mode):
         raise InstallError(f"hooks file is a symbolic link: {hooks_path}")
+    if not stat.S_ISREG(hooks_mode):
+        raise InstallError(f"hooks file must be a regular file: {hooks_path}")
 
 
 def _make_directory(path: Path) -> None:
@@ -370,28 +457,36 @@ def _make_directory(path: Path) -> None:
     while not _path_exists(current):
         missing.append(current)
         current = current.parent
-    if not current.is_dir():
+    current_mode = _lstat_mode(current)
+    if current_mode is None or not stat.S_ISDIR(current_mode):
         raise InstallError(f"expected a directory: {current}")
     for directory in reversed(missing):
         directory.mkdir(mode=0o700)
         directory.chmod(0o700)
-    if not path.is_dir():
+    path_mode = _lstat_mode(path)
+    if path_mode is None or not stat.S_ISDIR(path_mode):
         raise InstallError(f"expected a directory: {path}")
 
 
 def _apply_private_modes(root: Path) -> None:
     root.chmod(0o700)
-    for path in root.rglob("*"):
-        if path.is_dir():
+    for path, mode in _tree_entries(root, "staged skill"):
+        if stat.S_ISDIR(mode):
             path.chmod(0o700)
-        elif path.is_file():
-            source_mode = stat.S_IMODE(path.stat().st_mode)
-            path.chmod(0o700 if source_mode & 0o111 else 0o600)
+        elif stat.S_ISREG(mode):
+            path.chmod(0o700 if stat.S_IMODE(mode) & 0o111 else 0o600)
+        else:  # pragma: no cover - source validation precedes staged copying
+            raise InstallError(
+                f"staged skill contains {_mode_description(mode)}: {path}"
+            )
 
 
 def _load_hooks(path: Path) -> dict[str, Any]:
-    if not path.exists():
+    mode = _lstat_mode(path)
+    if mode is None:
         return {}
+    if not stat.S_ISREG(mode):
+        raise InstallError(f"hooks file must be a regular file: {path}")
     try:
         return _as_object(json.loads(path.read_text(encoding="utf-8")), "hooks file")
     except (OSError, json.JSONDecodeError, ValueError) as error:
@@ -423,17 +518,30 @@ def _create_backup_root(codex_home: Path) -> Path:
 
 
 def _files_below(path: Path) -> list[Path]:
-    if path.is_symlink() or path.is_file():
+    mode = _lstat_mode(path)
+    if mode is None:
+        return []
+    if stat.S_ISREG(mode):
         return [path]
-    return sorted(
-        candidate
-        for candidate in path.rglob("*")
-        if candidate.is_symlink() or candidate.is_file()
-    )
+    if not stat.S_ISDIR(mode):
+        raise InstallError(
+            f"backup source contains {_mode_description(mode)}: {path}"
+        )
+    files: list[Path] = []
+    for candidate, candidate_mode in _tree_entries(path, "backup source"):
+        if stat.S_ISREG(candidate_mode):
+            files.append(candidate)
+        elif not stat.S_ISDIR(candidate_mode):
+            raise InstallError(
+                "backup source contains "
+                f"{_mode_description(candidate_mode)}: {candidate}"
+            )
+    return sorted(files)
 
 
 def _mapped_backup_files(source: Path, destination: Path) -> list[Path]:
-    if source.is_symlink() or source.is_file():
+    mode = _lstat_mode(source)
+    if mode is not None and stat.S_ISREG(mode):
         return [destination]
     return [
         destination / path.relative_to(source)
@@ -442,9 +550,12 @@ def _mapped_backup_files(source: Path, destination: Path) -> list[Path]:
 
 
 def _remove_path(path: Path) -> None:
-    if path.is_symlink() or path.is_file():
+    mode = _lstat_mode(path)
+    if mode is None:
+        return
+    if not stat.S_ISDIR(mode):
         path.unlink(missing_ok=True)
-    elif path.is_dir():
+    else:
         shutil.rmtree(path)
 
 
@@ -457,7 +568,7 @@ def _stage_skill(source: Path, target: Path) -> Path:
         shutil.copytree(source, stage)
         _apply_private_modes(stage)
     except Exception:
-        if stage.exists():
+        if _path_exists(stage):
             shutil.rmtree(stage)
         raise
     return stage
@@ -487,10 +598,10 @@ def _installation_plan(
     sources = {name: source_root / "skills" / name for name in _SKILL_NAMES}
     for source in sources.values():
         _validate_source_tree(source)
-    _validate_managed_paths(codex_home)
 
     skills_dir = codex_home / "skills"
     targets = {name: skills_dir / name for name in _SKILL_NAMES}
+    _validate_managed_paths(codex_home, targets)
     hooks_path = codex_home / "hooks.json"
     existing_hooks = _load_hooks(hooks_path)
     managed_hooks = render_managed_hooks(
@@ -509,7 +620,7 @@ def _planned_backup(
     existing_targets = {
         name: target for name, target in targets.items() if _path_exists(target)
     }
-    if not existing_targets and not hooks_path.exists():
+    if not existing_targets and not _path_exists(hooks_path):
         return None, ()
     backup_root = _next_backup_root(codex_home)
     files: list[Path] = []
@@ -517,7 +628,7 @@ def _planned_backup(
         files.extend(
             _mapped_backup_files(target, backup_root / "skills" / name)
         )
-    if hooks_path.exists():
+    if _path_exists(hooks_path):
         files.append(backup_root / "hooks.json")
     return backup_root, tuple(files)
 
@@ -598,7 +709,7 @@ def install_bundle(
     moved_originals: dict[str, Path] = {}
     installed_names: set[str] = set()
     hooks_replaced = False
-    hooks_existed = hooks_path.exists()
+    hooks_existed = _path_exists(hooks_path)
     backup_root: Path | None = None
     backup_hooks: Path | None = None
     backed_up_files: tuple[Path, ...] = ()
@@ -673,7 +784,7 @@ def _planned_backup_from_root(
             files.extend(
                 _mapped_backup_files(target, backup_root / "skills" / name)
             )
-    if hooks_path.exists():
+    if _path_exists(hooks_path):
         files.append(backup_root / "hooks.json")
     return backup_root, tuple(files)
 
@@ -682,16 +793,16 @@ def uninstall_bundle(codex_home: Path, dry_run: bool) -> InstallReport:
     """Remove only bundle-managed skills and hooks, preserving handoff state."""
 
     codex_home = Path(codex_home).absolute()
-    _validate_managed_paths(codex_home)
     skills_dir = codex_home / "skills"
     targets = {name: skills_dir / name for name in _SKILL_NAMES}
+    _validate_managed_paths(codex_home, targets)
     hooks_path = codex_home / "hooks.json"
     existing_hooks = _load_hooks(hooks_path)
     try:
         remaining_hooks = remove_managed_hooks(existing_hooks)
     except ValueError as error:
         raise InstallError(f"cannot update hooks file {hooks_path}: {error}") from error
-    hooks_changed = hooks_path.exists() and remaining_hooks != existing_hooks
+    hooks_changed = _path_exists(hooks_path) and remaining_hooks != existing_hooks
     changed_paths = tuple(
         [
             *(target for target in targets.values() if _path_exists(target)),

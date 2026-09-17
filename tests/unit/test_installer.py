@@ -408,6 +408,118 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(_tree_snapshot(outside), outside_before)
             self.assertFalse((codex_home / "hooks.json").exists())
 
+    def test_managed_target_symlink_is_rejected_without_hook_or_outside_mutation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            codex_home = temp_root / "codex-home"
+            skills_dir = codex_home / "skills"
+            skills_dir.mkdir(parents=True)
+            outside = temp_root / "outside-project-handoff"
+            (outside / "scripts").mkdir(parents=True)
+            (outside / "sentinel.txt").write_text("outside\n", encoding="utf-8")
+            target = skills_dir / "project-handoff"
+            target.symlink_to(outside, target_is_directory=True)
+            hooks_path = codex_home / "hooks.json"
+            hooks_path.write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "Stop": [
+                                {
+                                    "hooks": [
+                                        {
+                                            "type": "command",
+                                            "command": "python3 /opt/other.py",
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hooks_before = hooks_path.read_bytes()
+            outside_before = _tree_snapshot(outside)
+            repo_root = Path(__file__).resolve().parents[2]
+
+            for dry_run in (True, False):
+                for attempt in range(2):
+                    with self.subTest(
+                        operation="install", dry_run=dry_run, attempt=attempt
+                    ):
+                        with self.assertRaisesRegex(InstallError, "symbolic link"):
+                            install_bundle(repo_root, codex_home, dry_run=dry_run)
+                        self.assertTrue(target.is_symlink())
+                        self.assertEqual(hooks_path.read_bytes(), hooks_before)
+                        self.assertNotIn(
+                            str(outside / "scripts" / "handoff_hook.py"),
+                            hooks_path.read_text(),
+                        )
+                        self.assertEqual(_tree_snapshot(outside), outside_before)
+
+            for dry_run in (True, False):
+                with self.subTest(operation="uninstall", dry_run=dry_run):
+                    with self.assertRaisesRegex(InstallError, "symbolic link"):
+                        installer_module.uninstall_bundle(
+                            codex_home, dry_run=dry_run
+                        )
+                    self.assertTrue(target.is_symlink())
+                    self.assertEqual(hooks_path.read_bytes(), hooks_before)
+                    self.assertEqual(_tree_snapshot(outside), outside_before)
+
+    def test_managed_target_nested_symlink_is_rejected_before_hook_rendering(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            codex_home = temp_root / "codex-home"
+            target = codex_home / "skills" / "project-handoff"
+            target.mkdir(parents=True)
+            outside_scripts = temp_root / "outside-scripts"
+            outside_scripts.mkdir()
+            (target / "scripts").symlink_to(
+                outside_scripts, target_is_directory=True
+            )
+            before = _tree_snapshot(codex_home)
+
+            with self.assertRaisesRegex(InstallError, "symbolic link"):
+                install_bundle(
+                    Path(__file__).resolve().parents[2],
+                    codex_home,
+                    dry_run=True,
+                )
+
+            self.assertEqual(_tree_snapshot(codex_home), before)
+            self.assertFalse((codex_home / "hooks.json").exists())
+
+    def test_hooks_fifo_is_rejected_without_reading_or_mutation(self):
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    codex_home = Path(temp_dir) / "codex-home"
+                    codex_home.mkdir()
+                    hooks_path = codex_home / "hooks.json"
+                    os.mkfifo(hooks_path)
+                    entries_before = tuple(codex_home.iterdir())
+                    real_read_text = Path.read_text
+
+                    def guarded_read_text(path, *args, **kwargs):
+                        if path == hooks_path:
+                            raise AssertionError("installer attempted to read FIFO")
+                        return real_read_text(path, *args, **kwargs)
+
+                    with patch.object(Path, "read_text", guarded_read_text):
+                        with self.assertRaisesRegex(
+                            InstallError, "hooks file must be a regular file"
+                        ):
+                            install_bundle(
+                                Path(__file__).resolve().parents[2],
+                                codex_home,
+                                dry_run=dry_run,
+                            )
+
+                    self.assertEqual(tuple(codex_home.iterdir()), entries_before)
+                    self.assertTrue(stat.S_ISFIFO(hooks_path.lstat().st_mode))
+
     def test_install_rejects_source_tree_symlink_without_creating_home(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
@@ -425,6 +537,47 @@ class InstallerTests(unittest.TestCase):
                 install_bundle(source_root, codex_home, dry_run=False)
 
             self.assertFalse(codex_home.exists())
+
+    def test_source_special_entries_are_rejected_before_destination_creation(self):
+        for entry_kind in ("fifo", "symlink"):
+            for dry_run in (True, False):
+                with self.subTest(entry_kind=entry_kind, dry_run=dry_run):
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        temp_root = Path(temp_dir)
+                        source_root = temp_root / "source"
+                        shutil.copytree(
+                            Path(__file__).resolve().parents[2] / "skills",
+                            source_root / "skills",
+                        )
+                        special = (
+                            source_root
+                            / "skills"
+                            / "task-router"
+                            / f"unsupported-{entry_kind}"
+                        )
+                        if entry_kind == "fifo":
+                            os.mkfifo(special)
+                        else:
+                            special.symlink_to(temp_root / "outside")
+                        codex_home = temp_root / "missing-codex-home"
+
+                        with patch.object(
+                            installer_module.shutil,
+                            "copytree",
+                            side_effect=AssertionError(
+                                "installer attempted to copy invalid source"
+                            ),
+                        ):
+                            with self.assertRaisesRegex(
+                                InstallError, "skill source contains"
+                            ):
+                                install_bundle(
+                                    source_root,
+                                    codex_home,
+                                    dry_run=dry_run,
+                                )
+
+                        self.assertFalse(codex_home.exists())
 
     def test_install_dry_run_rejects_non_directory_skills_parent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
