@@ -4,9 +4,114 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import shlex
 from pathlib import Path
 from typing import Any, Callable
+
+
+_PYTHON_EXECUTABLE = re.compile(r"python(?:\d+(?:\.\d+)*)?")
+_PYTHON_NO_ARGUMENT_OPTIONS = {
+    "-b",
+    "-bb",
+    "-B",
+    "-d",
+    "-E",
+    "-i",
+    "-I",
+    "-O",
+    "-OO",
+    "-P",
+    "-q",
+    "-s",
+    "-S",
+    "-u",
+    "-v",
+    "-x",
+}
+_PYTHON_ARGUMENT_OPTIONS = {"-W", "-X"}
+_PYTHON_NON_FILE_OPTIONS = {
+    "-c",
+    "-m",
+    "-h",
+    "-V",
+    "--help",
+    "--help-env",
+    "--help-xoptions",
+    "--help-all",
+    "--version",
+}
+
+
+def _env_command_index(parts: list[str]) -> int | None:
+    index = 1
+    while index < len(parts):
+        token = parts[index]
+        if token == "--":
+            index += 1
+            break
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token):
+            index += 1
+            continue
+        if token in {"-i", "--ignore-environment", "-0", "--null"}:
+            index += 1
+            continue
+        if token in {"-u", "--unset", "-C", "--chdir"}:
+            if index + 1 >= len(parts):
+                return None
+            index += 2
+            continue
+        if token.startswith(("--unset=", "--chdir=")):
+            if token.endswith("="):
+                return None
+            index += 1
+            continue
+        if (token.startswith("-u") or token.startswith("-C")) and len(token) > 2:
+            index += 1
+            continue
+        if token in {"-S", "--split-string"} or token.startswith(
+            "--split-string="
+        ):
+            return None
+        if token.startswith("-"):
+            return None
+        break
+    return index if index < len(parts) else None
+
+
+def _python_script_index(parts: list[str], index: int) -> int | None:
+    index += 1
+    while index < len(parts):
+        option = parts[index]
+        if option == "--":
+            index += 1
+            break
+        if option in _PYTHON_NON_FILE_OPTIONS:
+            return None
+        if option == "--check-hash-based-pycs":
+            if index + 1 >= len(parts) or parts[index + 1] not in {
+                "default",
+                "always",
+                "never",
+            }:
+                return None
+            index += 2
+            continue
+        if option in _PYTHON_ARGUMENT_OPTIONS:
+            if index + 1 >= len(parts):
+                return None
+            index += 2
+            continue
+        if option.startswith(("-W", "-X")) and len(option) > 2:
+            index += 1
+            continue
+        if option in _PYTHON_NO_ARGUMENT_OPTIONS:
+            index += 1
+            continue
+        if option.startswith("-"):
+            return None
+        break
+    return index if index < len(parts) else None
 
 
 def render_managed_hooks(hook_script: Path) -> dict[str, Any]:
@@ -50,25 +155,17 @@ def _command_target(command: str) -> Path | None:
 
     index = 0
     if Path(parts[index]).name == "env":
-        index += 1
-        while index < len(parts) and (
-            parts[index].startswith("-") or "=" in parts[index]
-        ):
-            index += 1
-        if index == len(parts):
+        command_index = _env_command_index(parts)
+        if command_index is None:
             return None
+        index = command_index
 
     executable = Path(parts[index]).name
-    if executable.startswith("python"):
-        index += 1
-        while index < len(parts) and parts[index].startswith("-"):
-            option = parts[index]
-            if option in {"-c", "-m"}:
-                return None
-            index += 2 if option in {"-W", "-X"} else 1
-        if index == len(parts):
+    if _PYTHON_EXECUTABLE.fullmatch(executable):
+        script_index = _python_script_index(parts, index)
+        if script_index is None:
             return None
-        target = parts[index]
+        target = parts[script_index]
     else:
         target = parts[index]
     return Path(target).expanduser().resolve()
@@ -110,13 +207,28 @@ def _validate_hooks(value: object, label: str) -> dict[str, Any]:
 
 
 def _managed_target(managed: dict[str, Any]) -> Path:
+    managed_target: Path | None = None
     for groups in managed["hooks"].values():
         for group in groups:
+            if not group["hooks"]:
+                raise ValueError(
+                    "managed hook groups must contain a command handler"
+                )
             for handler in group["hooks"]:
                 target = _command_target(handler["command"])
-                if target is not None:
-                    return target
-    raise ValueError("managed hooks contain no command handler")
+                if target is None:
+                    raise ValueError(
+                        "managed hook commands must have a parseable target"
+                    )
+                if managed_target is None:
+                    managed_target = target
+                elif target != managed_target:
+                    raise ValueError(
+                        "managed hook commands must use the same executable target"
+                    )
+    if managed_target is None:
+        raise ValueError("managed hooks contain no command handler")
+    return managed_target
 
 
 def _without_matching_handlers(
@@ -140,9 +252,9 @@ def _without_matching_handlers(
 def merge_hooks(existing: dict[str, Any], managed: dict[str, Any]) -> dict[str, Any]:
     existing = _validate_hooks(existing, "existing hooks")
     managed = _validate_hooks(managed, "managed hooks")
+    target = _managed_target(managed)
     result = copy.deepcopy(existing)
     result.setdefault("hooks", {})
-    target = _managed_target(managed)
 
     for event, existing_groups in result["hooks"].items():
         result["hooks"][event] = _without_matching_handlers(
