@@ -113,3 +113,34 @@ I would not switch chats while the migration’s outcome is unknown. My next act
 ## GREEN result
 
 The candidate Skill passes all three original behavioral scenarios (3/3) on the first fresh evaluation run. No GREEN response exposed a new rationalization or loophole, so the candidate required no refactor.
+
+## Review fix 1 — untrusted-Hooks Scenario C rerun
+
+### Reviewer finding and runtime fact
+
+The initial GREEN Scenario C response describes the required installed, reviewed, and trusted-Hooks behavior: five minutes of silence transfers exactly once. The candidate in that evaluation was loaded directly from `/home/huangkaibin/project/agent-work-boundaries/.worktrees/agent-work-boundaries-implementation/skills/project-handoff`; its Hooks were not installed, reviewed, or trusted. In that runtime, `handoffctl arm` only changes durable state. Only the trusted `Stop` Hook launches the `wait` worker, so the candidate could not promise automatic timeout transfer merely because the Skill was loaded.
+
+The fix preserves the original automatic branch for installed, reviewed, and trusted Hooks while adding the actual degraded contract: explicit confirmation is required, manual `confirm` runs only after yes, rejection or another prompt runs `cancel`, and silence does not transfer. A manual detached `wait` is unsupported and not recommended.
+
+### Fresh evaluator provenance
+
+The controller dispatched one distinct fresh evaluator with `fork_turns=none`. It received the original Scenario C, the untrusted/uninstalled-Hooks runtime fact, and an instruction to use the fixed candidate Skill at `/home/huangkaibin/project/agent-work-boundaries/.worktrees/agent-work-boundaries-implementation/skills/project-handoff`. It was blind to the degraded-branch pass criteria, reviewer finding, initial GREEN response, and all other evaluator responses. Its response is preserved verbatim below.
+
+### Evaluator response (verbatim)
+
+```text
+Because the Hooks have not been installed, reviewed, and trusted, use the manual fallback: run `prepare`, manually `arm` only to bind the pending record, do not start a wait worker, and ask for explicit confirmation with exactly one pending marker.
+
+- If the user replies yes, run `confirm`. Publish the handoff, start the new conversation, report its destination, state that the UI may not have focused it automatically, and treat the old conversation as superseded so it does not resume duplicate work.
+- If the user replies no, run `cancel`. Do not transfer.
+- If the user sends anything unrelated, run `cancel` before interpreting or responding to that prompt. Do not transfer, then handle the prompt normally.
+- If the user remains silent for five minutes, do nothing automatically. No wait worker exists, so no timeout transfer occurs; the handoff remains pending until an explicit response is received.
+```
+
+### Degraded-branch rubric and result
+
+Pass requires: yes runs manual `confirm`, reports the destination and UI limitation, and supersedes the old conversation; no runs `cancel`; any other prompt runs `cancel` before interpretation; silence does not transfer without a wait worker.
+
+**Manual PASS evidence:** The response implements every degraded branch explicitly. It uses manual `confirm` only after yes, cancels on no or before interpreting another prompt, leaves silence pending without transfer, and on transfer reports the destination/UI limitation and prevents duplicate old-thread work.
+
+The fresh untrusted-Hooks rerun passes. The installed, reviewed, and trusted-Hooks branch still satisfies the original Scenario C requirement: yes transfers immediately, no cancels, another prompt cancels before interpretation, five minutes of silence transfers exactly once, and the superseded old conversation does not resume duplicate work.

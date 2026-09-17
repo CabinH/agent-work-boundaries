@@ -10,21 +10,23 @@ The draft must contain the four top-level headings required by `SKILL.md`. Keep 
 "<sys.executable>" "<absolute-skill-directory>/scripts/handoffctl.py" prepare --cwd "<absolute-project-root>" --from-file "<absolute-draft-file>" --target "docs/AI-HANDOFF.md"
 ```
 
-Read `pending_id` from the JSON response. Normally, ask for confirmation and end the assistant response with exactly one canonical marker; the trusted `Stop` Hook arms the five-minute worker:
+Read `pending_id` from the JSON response. When Hooks are installed, reviewed, and trusted through `/hooks`, ask for confirmation and end the assistant response with exactly one canonical marker. The trusted `Stop` Hook arms the handoff and launches the five-minute wait worker:
 
 ```text
 <!-- project-handoff:pending=<pending_id> -->
 ```
 
-To arm manually, use the current conversation's real session ID. Production timeout is exactly 300 seconds:
+The arm command uses the current conversation's real session ID. Production timeout is exactly 300 seconds:
 
 ```bash
 "<sys.executable>" "<absolute-skill-directory>/scripts/handoffctl.py" arm --pending-id "<pending_id>" --session-id "<current-session-id>" --timeout-seconds 300
 ```
 
+Running `arm` manually only changes durable state; it does not spawn `wait` or create an automatic timeout. Do not launch a detached `wait` manually: its lifecycle is Hook-owned, and a manual detached worker is unsupported and not recommended.
+
 ## Control and inspect
 
-Any user prompt atomically stops an armed countdown. Then use the matching command:
+With trusted Hooks, any user prompt atomically stops an armed countdown. Then use the matching command:
 
 ```bash
 "<sys.executable>" "<absolute-skill-directory>/scripts/handoffctl.py" confirm --pending-id "<pending_id>"
@@ -38,7 +40,9 @@ States progress through `draft`, `armed`, `responded` or `expired`, `transferrin
 
 ## Hooks and failure recovery
 
-After installation, run `/hooks`, inspect the `Stop`, `UserPromptSubmit`, `PostCompact`, and `SessionStart` handlers, and trust their current hash. Until then, automatic countdown and compaction tracking are inactive. Use `prepare`, manual `arm`, and—only after the user confirms—manual `confirm`; use `cancel` on rejection or another prompt.
+After installation, run `/hooks`, inspect the `Stop`, `UserPromptSubmit`, `PostCompact`, and `SessionStart` handlers, and trust their current hash. Until then, automatic countdown and compaction tracking are unavailable.
+
+For the manual fallback, run `prepare`, then manual `arm` solely to bind the record and make it confirmable; do not start `wait`. Ask for explicit confirmation. Run manual `confirm` only after yes. Run `cancel` after rejection or any other prompt. Silence does not transfer.
 
 If a timer, Hook, or transfer fails, run `status`. A `failed` result includes `recovery_prompt`; retry `confirm` if automatic creation is appropriate, or recover manually:
 

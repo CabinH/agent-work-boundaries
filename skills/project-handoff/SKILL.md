@@ -20,7 +20,11 @@ Do not hand off merely for a small supporting task or while the current operatio
 
 ## Decision contract
 
-Operational guidance (Variant B): After repeated compaction, identify the next stable boundary before starting another major work segment. At that boundary prepare a handoff containing completed work, agreed rules and decisions, verification status, and exactly one next step, then request transfer to a new conversation in the same project. Finish or safely stop any non-interruptible operation first. On confirmation transfer immediately; on rejection cancel; on any other prompt cancel the countdown before interpreting the prompt; after five minutes of silence transfer exactly once. After transfer, direct the user to the created conversation and prevent duplicate work in the old one; state that creation does not mean the UI focused it automatically.
+After repeated compaction, identify the next stable boundary before starting another major work segment. At that boundary prepare a handoff containing completed work, agreed rules and decisions, verification status, and exactly one next step, then request transfer to a new conversation in the same project. Finish or safely stop any non-interruptible operation first.
+
+With installed Hooks reviewed and trusted through `/hooks`: on confirmation transfer immediately; on rejection cancel; on any other prompt cancel the countdown before interpreting the prompt; after five minutes of silence transfer exactly once. After transfer, direct the user to the created conversation and prevent duplicate work in the old one; state that creation does not mean the UI focused it automatically.
+
+Until Hooks are installed and trusted, automatic countdown and compaction tracking are unavailable. Require explicit confirmation: manually `arm` without a wait worker, run `confirm` only after yes, and run `cancel` after rejection or any other prompt. Silence does not transfer.
 
 The draft uses these top-level headings:
 
