@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import errno
+import fcntl
 import json
 import os
 import re
@@ -11,7 +13,8 @@ import shlex
 import shutil
 import stat
 import sys
-import tempfile
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,6 +54,11 @@ _PYTHON_NON_FILE_OPTIONS = {
     "--version",
 }
 _SKILL_NAMES = ("project-handoff", "task-router")
+_BUNDLE_NAME = "agent-work-boundaries"
+_LOCK_NAME = ".agent-work-boundaries.lock"
+_JOURNAL_NAME = ".agent-work-boundaries.transaction.json"
+_TRANSACTION_ID = re.compile(r"[0-9a-f]{32}")
+_BACKUP_ID = re.compile(r"\d{8}T\d{6}Z(?:-\d{2,})?")
 
 
 class InstallError(RuntimeError):
@@ -235,7 +243,9 @@ def _validate_hooks(value: object, label: str) -> dict[str, Any]:
                     raise ValueError(f"{label}.{event} handlers must be objects")
                 if not isinstance(handler.get("type"), str):
                     raise ValueError(f"{label}.{event} handler type must be a string")
-                if not isinstance(handler.get("command"), str):
+                if handler["type"] == "command" and not isinstance(
+                    handler.get("command"), str
+                ):
                     raise ValueError(f"{label}.{event} handler command must be a string")
     return document
 
@@ -249,6 +259,10 @@ def _managed_target(managed: dict[str, Any]) -> Path:
                     "managed hook groups must contain a command handler"
                 )
             for handler in group["hooks"]:
+                if handler["type"] != "command":
+                    raise ValueError(
+                        "managed hook groups may contain only command handlers"
+                    )
                 target = _command_target(handler["command"])
                 if target is None:
                     raise ValueError(
@@ -273,7 +287,10 @@ def _without_matching_handlers(
         kept_handlers = [
             handler
             for handler in group["hooks"]
-            if not predicate(_command_target(handler["command"]))
+            if not (
+                handler["type"] == "command"
+                and predicate(_command_target(handler["command"]))
+            )
         ]
         removed_handler = len(kept_handlers) != len(group["hooks"])
         if kept_handlers or not removed_handler:
@@ -299,26 +316,18 @@ def merge_hooks(existing: dict[str, Any], managed: dict[str, Any]) -> dict[str, 
     return result
 
 
-def _is_managed_install_target(target: Path | None) -> bool:
-    if target is None:
-        return False
-    return target.parts[-4:] == (
-        "skills",
-        "project-handoff",
-        "scripts",
-        "handoff_hook.py",
-    )
-
-
-def remove_managed_hooks(existing: dict[str, Any]) -> dict[str, Any]:
+def remove_managed_hooks(
+    existing: dict[str, Any], installed_hook_script: Path
+) -> dict[str, Any]:
     existing = _validate_hooks(existing, "existing hooks")
+    installed_target = Path(installed_hook_script).expanduser().resolve()
     result = copy.deepcopy(existing)
     if "hooks" not in result:
         return result
 
     for event, groups in result["hooks"].items():
         result["hooks"][event] = _without_matching_handlers(
-            groups, _is_managed_install_target
+            groups, lambda candidate: candidate == installed_target
         )
     return result
 
@@ -346,6 +355,54 @@ def _mode_description(mode: int) -> str:
     if stat.S_ISBLK(mode):
         return "a block device"
     return "an unsupported file type"
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist directory-entry changes without following a replacement link."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise InstallError(f"cannot open directory for fsync {path}: {error}") from error
+    try:
+        mode = os.fstat(descriptor).st_mode
+        if not stat.S_ISDIR(mode):
+            raise InstallError(f"expected a directory: {path}")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_regular_file(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise InstallError(f"cannot open file for fsync {path}: {error}") from error
+    try:
+        mode = os.fstat(descriptor).st_mode
+        if not stat.S_ISREG(mode):
+            raise InstallError(f"expected a regular file: {path}")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _replace_and_fsync(source: Path, target: Path) -> None:
+    source = Path(source)
+    target = Path(target)
+    os.replace(source, target)
+    _fsync_directory(target.parent)
+    if source.parent != target.parent:
+        _fsync_directory(source.parent)
+
+
+def _unlink_and_fsync(path: Path) -> None:
+    path.unlink()
+    _fsync_directory(path.parent)
 
 
 def _tree_entries(root: Path, label: str) -> list[tuple[Path, int]]:
@@ -419,9 +476,24 @@ def _validate_managed_target(name: str, target: Path) -> None:
     _validate_regular_tree(target, f"managed skill target {name}")
 
 
-def _validate_managed_paths(
-    codex_home: Path, targets: dict[str, Path]
-) -> None:
+def _validate_private_control_entry(path: Path, label: str) -> None:
+    mode = _lstat_mode(path)
+    if mode is None:
+        return
+    if stat.S_ISLNK(mode):
+        raise InstallError(f"{label} is a symbolic link: {path}")
+    if not stat.S_ISREG(mode):
+        raise InstallError(f"{label} must be a regular file: {path}")
+    metadata = path.lstat()
+    if metadata.st_nlink != 1:
+        raise InstallError(f"{label} must not have hard links: {path}")
+    if metadata.st_uid != os.getuid():
+        raise InstallError(f"{label} must be owned by the current user: {path}")
+    if stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise InstallError(f"{label} permissions must be private: {path}")
+
+
+def _validate_managed_paths(codex_home: Path, targets: dict[str, Path]) -> None:
     _assert_no_symlink_components(codex_home, "CODEX_HOME path")
     home_mode = _lstat_mode(codex_home)
     if home_mode is not None and not stat.S_ISDIR(home_mode):
@@ -445,12 +517,17 @@ def _validate_managed_paths(
         _validate_managed_target(name, target)
     hooks_path = codex_home / "hooks.json"
     hooks_mode = _lstat_mode(hooks_path)
-    if hooks_mode is None:
-        return
-    if stat.S_ISLNK(hooks_mode):
-        raise InstallError(f"hooks file is a symbolic link: {hooks_path}")
-    if not stat.S_ISREG(hooks_mode):
-        raise InstallError(f"hooks file must be a regular file: {hooks_path}")
+    if hooks_mode is not None:
+        if stat.S_ISLNK(hooks_mode):
+            raise InstallError(f"hooks file is a symbolic link: {hooks_path}")
+        if not stat.S_ISREG(hooks_mode):
+            raise InstallError(f"hooks file must be a regular file: {hooks_path}")
+    _validate_private_control_entry(
+        codex_home / _LOCK_NAME, "bundle lock file"
+    )
+    _validate_private_control_entry(
+        codex_home / _JOURNAL_NAME, "transaction journal"
+    )
 
 
 def _make_directory(path: Path) -> None:
@@ -465,12 +542,24 @@ def _make_directory(path: Path) -> None:
     for directory in reversed(missing):
         directory.mkdir(mode=0o700)
         directory.chmod(0o700)
+        _fsync_directory(directory)
+        _fsync_directory(directory.parent)
     path_mode = _lstat_mode(path)
     if path_mode is None or not stat.S_ISDIR(path_mode):
         raise InstallError(f"expected a directory: {path}")
 
 
 def _apply_private_modes(root: Path) -> None:
+    root_mode = _lstat_mode(root)
+    if root_mode is None:
+        raise InstallError(f"missing staged path: {root}")
+    if stat.S_ISREG(root_mode):
+        root.chmod(0o700 if stat.S_IMODE(root_mode) & 0o111 else 0o600)
+        return
+    if not stat.S_ISDIR(root_mode):
+        raise InstallError(
+            f"staged path contains {_mode_description(root_mode)}: {root}"
+        )
     root.chmod(0o700)
     for path, mode in _tree_entries(root, "staged skill"):
         if stat.S_ISDIR(mode):
@@ -481,6 +570,34 @@ def _apply_private_modes(root: Path) -> None:
             raise InstallError(
                 f"staged skill contains {_mode_description(mode)}: {path}"
             )
+
+
+def _fsync_tree(root: Path) -> None:
+    mode = _lstat_mode(root)
+    if mode is None:
+        raise InstallError(f"missing path to fsync: {root}")
+    if stat.S_ISREG(mode):
+        _fsync_regular_file(root)
+        return
+    if not stat.S_ISDIR(mode):
+        raise InstallError(
+            f"cannot fsync {_mode_description(mode)}: {root}"
+        )
+    entries = _tree_entries(root, "durable tree")
+    for path, entry_mode in entries:
+        if stat.S_ISREG(entry_mode):
+            _fsync_regular_file(path)
+        elif not stat.S_ISDIR(entry_mode):
+            raise InstallError(
+                f"durable tree contains {_mode_description(entry_mode)}: {path}"
+            )
+    directories = [
+        path for path, entry_mode in entries if stat.S_ISDIR(entry_mode)
+    ]
+    directories.sort(key=lambda candidate: len(candidate.parts), reverse=True)
+    for directory in directories:
+        _fsync_directory(directory)
+    _fsync_directory(root)
 
 
 def _load_hooks(path: Path) -> dict[str, Any]:
@@ -514,6 +631,8 @@ def _create_backup_root(codex_home: Path) -> Path:
         try:
             candidate.mkdir(mode=0o700)
             candidate.chmod(0o700)
+            _fsync_directory(candidate)
+            _fsync_directory(candidate.parent)
             return candidate
         except FileExistsError:
             continue
@@ -555,10 +674,21 @@ def _remove_path(path: Path) -> None:
     mode = _lstat_mode(path)
     if mode is None:
         return
-    if not stat.S_ISDIR(mode):
-        path.unlink(missing_ok=True)
-    else:
+    if stat.S_ISLNK(mode) or not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+        raise InstallError(
+            f"refusing to remove {_mode_description(mode)}: {path}"
+        )
+    if stat.S_ISDIR(mode):
         shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _remove_path_and_fsync(path: Path) -> None:
+    if not _path_exists(path):
+        return
+    _remove_path(path)
+    _fsync_directory(path.parent)
 
 
 def _ignore_python_runtime_artifacts(
@@ -578,39 +708,86 @@ def _ignore_python_runtime_artifacts(
     return sorted(ignored)
 
 
-def _stage_skill(source: Path, target: Path) -> Path:
-    stage = Path(
-        tempfile.mkdtemp(prefix=f".{target.name}.stage-", dir=str(target.parent))
-    )
-    stage.rmdir()
+def _skill_stage(codex_home: Path, name: str, transaction_id: str) -> Path:
+    return codex_home / "skills" / f".{name}.stage-{transaction_id}"
+
+
+def _skill_retired(codex_home: Path, name: str, transaction_id: str) -> Path:
+    return codex_home / "skills" / f".{name}.retired-{transaction_id}"
+
+
+def _skill_recovery(codex_home: Path, name: str, transaction_id: str) -> Path:
+    return codex_home / "skills" / f".{name}.recovery-{transaction_id}"
+
+
+def _hooks_stage(codex_home: Path, transaction_id: str) -> Path:
+    return codex_home / f".hooks.json.stage-{transaction_id}"
+
+
+def _hooks_recovery(codex_home: Path, transaction_id: str) -> Path:
+    return codex_home / f".hooks.json.recovery-{transaction_id}"
+
+
+def _stage_skill(source: Path, target: Path, stage: Path) -> Path:
+    if _path_exists(stage):
+        raise InstallError(f"staged skill path already exists: {stage}")
     try:
-        shutil.copytree(
-            source, stage, ignore=_ignore_python_runtime_artifacts
-        )
+        shutil.copytree(source, stage, ignore=_ignore_python_runtime_artifacts)
         _apply_private_modes(stage)
-    except Exception:
+        _fsync_tree(stage)
+        _fsync_directory(target.parent)
+    except BaseException:
         if _path_exists(stage):
-            shutil.rmtree(stage)
+            _remove_path_and_fsync(stage)
         raise
     return stage
 
 
-def _stage_hooks(path: Path, document: dict[str, Any]) -> Path:
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=".hooks.json.stage-", dir=str(path.parent)
-    )
-    temporary = Path(temporary_name)
+def _stage_hooks(path: Path, document: dict[str, Any], stage: Path) -> Path:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(stage, flags, 0o600)
+    except OSError as error:
+        raise InstallError(f"cannot create hooks stage {stage}: {error}") from error
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             json.dump(document, stream, indent=2, ensure_ascii=False)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        temporary.chmod(0o600)
-    except Exception:
-        temporary.unlink(missing_ok=True)
+        stage.chmod(0o600)
+        _fsync_regular_file(stage)
+        _fsync_directory(path.parent)
+    except BaseException:
+        if _path_exists(stage):
+            _remove_path_and_fsync(stage)
         raise
-    return temporary
+    return stage
+
+
+def _copy_path_durable(source: Path, destination: Path) -> None:
+    if _path_exists(destination):
+        raise InstallError(f"backup destination already exists: {destination}")
+    _make_directory(destination.parent)
+    mode = _lstat_mode(source)
+    if mode is None:
+        raise InstallError(f"backup source disappeared: {source}")
+    try:
+        if stat.S_ISDIR(mode):
+            shutil.copytree(source, destination)
+        elif stat.S_ISREG(mode):
+            shutil.copy2(source, destination)
+        else:
+            raise InstallError(
+                f"backup source contains {_mode_description(mode)}: {source}"
+            )
+        _fsync_tree(destination)
+        _fsync_directory(destination.parent)
+    except BaseException:
+        if _path_exists(destination):
+            _remove_path_and_fsync(destination)
+        raise
 
 
 def _installation_plan(
@@ -635,6 +812,40 @@ def _installation_plan(
     return sources, targets, hooks_path, merged_hooks
 
 
+def _uninstallation_plan(
+    codex_home: Path,
+) -> tuple[
+    dict[str, Path],
+    Path,
+    dict[str, Any],
+    bool,
+    tuple[Path, ...],
+]:
+    targets = {
+        name: codex_home / "skills" / name for name in _SKILL_NAMES
+    }
+    _validate_managed_paths(codex_home, targets)
+    hooks_path = codex_home / "hooks.json"
+    existing_hooks = _load_hooks(hooks_path)
+    installed_hook = (
+        targets["project-handoff"] / "scripts" / "handoff_hook.py"
+    )
+    try:
+        remaining_hooks = remove_managed_hooks(existing_hooks, installed_hook)
+    except ValueError as error:
+        raise InstallError(
+            f"cannot update hooks file {hooks_path}: {error}"
+        ) from error
+    hooks_changed = _path_exists(hooks_path) and remaining_hooks != existing_hooks
+    changed_paths = tuple(
+        [
+            *(target for target in targets.values() if _path_exists(target)),
+            *([hooks_path] if hooks_changed else []),
+        ]
+    )
+    return targets, hooks_path, remaining_hooks, hooks_changed, changed_paths
+
+
 def _planned_backup(
     codex_home: Path, targets: dict[str, Path], hooks_path: Path
 ) -> tuple[Path | None, tuple[Path, ...]]:
@@ -654,51 +865,510 @@ def _planned_backup(
     return backup_root, tuple(files)
 
 
-def _rollback_install(
-    targets: dict[str, Path],
-    installed_names: set[str],
-    moved_originals: dict[str, Path],
-    hooks_path: Path,
-    hooks_replaced: bool,
-    hooks_existed: bool,
-    backup_hooks: Path | None,
-) -> list[str]:
-    failures: list[str] = []
-    if hooks_replaced:
-        try:
-            if hooks_existed:
-                assert backup_hooks is not None
-                restore_stage = _stage_file_copy(backup_hooks, hooks_path)
-                os.replace(restore_stage, hooks_path)
-            else:
-                hooks_path.unlink(missing_ok=True)
-        except Exception as error:  # pragma: no cover - exceptional recovery path
-            failures.append(f"hooks: {error}")
-    for name in reversed(_SKILL_NAMES):
-        target = targets[name]
-        try:
-            if name in installed_names:
-                _remove_path(target)
-            backup = moved_originals.get(name)
-            if backup is not None and _path_exists(backup):
-                os.replace(backup, target)
-        except Exception as error:  # pragma: no cover - exceptional recovery path
-            failures.append(f"{name}: {error}")
-    return failures
+@contextmanager
+def _bundle_lock(codex_home: Path):
+    """Hold the persistent per-bundle lock without following links."""
 
-
-def _stage_file_copy(source: Path, destination: Path) -> Path:
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.restore-", dir=str(destination.parent)
-    )
-    os.close(descriptor)
-    temporary = Path(temporary_name)
+    lock_path = codex_home / _LOCK_NAME
+    _assert_no_symlink_components(codex_home, "CODEX_HOME path")
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    created = False
     try:
-        shutil.copy2(source, temporary)
-    except Exception:
-        temporary.unlink(missing_ok=True)
+        descriptor = os.open(lock_path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+    except FileExistsError:
+        _validate_private_control_entry(lock_path, "bundle lock file")
+        try:
+            descriptor = os.open(lock_path, flags)
+        except OSError as error:
+            raise InstallError(f"cannot open bundle lock file {lock_path}: {error}") from error
+    except OSError as error:
+        raise InstallError(f"cannot create bundle lock file {lock_path}: {error}") from error
+
+    try:
+        metadata = os.fstat(descriptor)
+        current = lock_path.lstat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise InstallError(f"bundle lock file must be regular: {lock_path}")
+        if (metadata.st_dev, metadata.st_ino) != (current.st_dev, current.st_ino):
+            raise InstallError(f"bundle lock file changed while opening: {lock_path}")
+        if metadata.st_nlink != 1 or metadata.st_uid != os.getuid():
+            raise InstallError(f"bundle lock file ownership is unsafe: {lock_path}")
+        if created:
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+            _fsync_directory(codex_home)
+        elif stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise InstallError(f"bundle lock file permissions must be private: {lock_path}")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN}:
+                raise InstallError(
+                    "another Agent Work Boundaries install or uninstall operation is running"
+                ) from error
+            raise InstallError(f"cannot acquire bundle lock {lock_path}: {error}") from error
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _journal_path(codex_home: Path) -> Path:
+    return codex_home / _JOURNAL_NAME
+
+
+def _exact_keys(value: dict[str, Any], expected: set[str], label: str) -> None:
+    if set(value) != expected:
+        raise InstallError(f"transaction journal has invalid {label} fields")
+
+
+def _validate_journal_document(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise InstallError("transaction journal must contain a JSON object")
+    _exact_keys(
+        value,
+        {"version", "bundle", "action", "transaction_id", "backup_id", "skills", "hooks"},
+        "top-level",
+    )
+    if type(value["version"]) is not int or value["version"] != 1:
+        raise InstallError("transaction journal version is unsupported")
+    if value["bundle"] != _BUNDLE_NAME:
+        raise InstallError("transaction journal bundle identifier is invalid")
+    if value["action"] not in {"install", "uninstall"}:
+        raise InstallError("transaction journal action is invalid")
+    transaction_id = value["transaction_id"]
+    if not isinstance(transaction_id, str) or not _TRANSACTION_ID.fullmatch(
+        transaction_id
+    ):
+        raise InstallError("transaction journal identifier is invalid")
+    backup_id = value["backup_id"]
+    if backup_id is not None and (
+        not isinstance(backup_id, str) or not _BACKUP_ID.fullmatch(backup_id)
+    ):
+        raise InstallError("transaction journal backup identifier is invalid")
+
+    skills = value["skills"]
+    if not isinstance(skills, dict):
+        raise InstallError("transaction journal skills field is invalid")
+    _exact_keys(skills, set(_SKILL_NAMES), "skills")
+    any_original = False
+    expected_install = value["action"] == "install"
+    for name in _SKILL_NAMES:
+        entry = skills[name]
+        if not isinstance(entry, dict):
+            raise InstallError(f"transaction journal skill {name} is invalid")
+        _exact_keys(entry, {"original", "install"}, f"skill {name}")
+        if type(entry["original"]) is not bool or type(entry["install"]) is not bool:
+            raise InstallError(f"transaction journal skill {name} flags are invalid")
+        if entry["install"] != expected_install:
+            raise InstallError(f"transaction journal skill {name} intent is invalid")
+        any_original = any_original or entry["original"]
+
+    hooks = value["hooks"]
+    if not isinstance(hooks, dict):
+        raise InstallError("transaction journal hooks field is invalid")
+    _exact_keys(hooks, {"original", "replace"}, "hooks")
+    if type(hooks["original"]) is not bool or type(hooks["replace"]) is not bool:
+        raise InstallError("transaction journal hook flags are invalid")
+    if hooks["original"] and not hooks["replace"]:
+        raise InstallError("transaction journal hook intent is invalid")
+    if expected_install and not hooks["replace"]:
+        raise InstallError("install transaction must replace hooks")
+    any_original = any_original or hooks["original"]
+    if any_original != (backup_id is not None):
+        raise InstallError("transaction journal backup intent is inconsistent")
+    return value
+
+
+def _read_journal(codex_home: Path) -> dict[str, Any] | None:
+    path = _journal_path(codex_home)
+    mode = _lstat_mode(path)
+    if mode is None:
+        return None
+    _validate_private_control_entry(path, "transaction journal")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise InstallError(f"cannot open transaction journal {path}: {error}") from error
+    try:
+        opened = os.fstat(descriptor)
+        current = path.lstat()
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise InstallError("transaction journal changed while opening")
+        payload = os.read(descriptor, 65537)
+        if len(payload) > 65536:
+            raise InstallError("transaction journal is too large")
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise InstallError(f"transaction journal is corrupt: {error}") from error
+    return _validate_journal_document(value)
+
+
+def _write_journal(codex_home: Path, document: dict[str, Any]) -> None:
+    document = _validate_journal_document(document)
+    journal = _journal_path(codex_home)
+    if _path_exists(journal):
+        raise InstallError(f"transaction journal already exists: {journal}")
+    temporary = codex_home / f"{_JOURNAL_NAME}.tmp-{document['transaction_id']}"
+    if _path_exists(temporary):
+        raise InstallError(f"transaction journal stage already exists: {temporary}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(temporary, flags, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(document, stream, sort_keys=True, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(0o600)
+        _fsync_regular_file(temporary)
+        _fsync_directory(codex_home)
+        _replace_and_fsync(temporary, journal)
+    except BaseException:
+        if _path_exists(temporary):
+            _remove_path_and_fsync(temporary)
         raise
-    return temporary
+
+
+def _clear_journal(codex_home: Path) -> None:
+    journal = _journal_path(codex_home)
+    if not _path_exists(journal):
+        return
+    document = _read_journal(codex_home)
+    assert document is not None
+    try:
+        _unlink_and_fsync(journal)
+    except Exception as error:
+        if not _path_exists(journal):
+            try:
+                _write_journal(codex_home, document)
+            except Exception as restore_error:
+                raise InstallError(
+                    "transaction journal removal was not durable and its "
+                    f"recovery record could not be reinstated: {restore_error}"
+                ) from error
+        raise
+
+
+def _backup_root_from_document(
+    codex_home: Path, document: dict[str, Any]
+) -> Path | None:
+    backup_id = document["backup_id"]
+    if backup_id is None:
+        return None
+    return codex_home / "backups" / _BUNDLE_NAME / backup_id
+
+
+def _validate_transaction_artifacts(
+    codex_home: Path, document: dict[str, Any]
+) -> None:
+    transaction_id = document["transaction_id"]
+    backup_root = _backup_root_from_document(codex_home, document)
+    if backup_root is not None:
+        _assert_no_symlink_components(backup_root, "transaction backup path")
+        mode = _lstat_mode(backup_root)
+        if mode is None or not stat.S_ISDIR(mode):
+            raise InstallError("transaction journal backup directory is missing")
+    for name in _SKILL_NAMES:
+        entry = document["skills"][name]
+        if entry["original"]:
+            assert backup_root is not None
+            backup = backup_root / "skills" / name
+            mode = _lstat_mode(backup)
+            if mode is None:
+                raise InstallError(f"transaction backup is missing for {name}")
+            if stat.S_ISDIR(mode):
+                _validate_regular_tree(backup, f"transaction backup {name}")
+            elif not stat.S_ISREG(mode):
+                raise InstallError(f"transaction backup is invalid for {name}")
+        for path, label in (
+            (_skill_stage(codex_home, name, transaction_id), "stage"),
+            (_skill_retired(codex_home, name, transaction_id), "retired path"),
+            (_skill_recovery(codex_home, name, transaction_id), "recovery path"),
+        ):
+            mode = _lstat_mode(path)
+            if mode is None:
+                continue
+            if stat.S_ISDIR(mode):
+                _validate_regular_tree(path, f"transaction {label} {name}")
+            elif not stat.S_ISREG(mode):
+                raise InstallError(
+                    f"transaction journal points to invalid {label} for {name}"
+                )
+    if document["hooks"]["original"]:
+        assert backup_root is not None
+        backup_hooks = backup_root / "hooks.json"
+        if not stat.S_ISREG(_lstat_mode(backup_hooks) or 0):
+            raise InstallError("transaction hooks backup is missing or invalid")
+    for path, label in (
+        (_hooks_stage(codex_home, transaction_id), "hooks stage"),
+        (_hooks_recovery(codex_home, transaction_id), "hooks recovery path"),
+    ):
+        mode = _lstat_mode(path)
+        if mode is not None and not stat.S_ISREG(mode):
+            raise InstallError(f"transaction {label} is invalid")
+
+
+def _restore_backup(
+    source: Path, target: Path, recovery: Path
+) -> None:
+    if _path_exists(recovery):
+        _remove_path_and_fsync(recovery)
+    _copy_path_durable(source, recovery)
+    if _path_exists(target):
+        _remove_path_and_fsync(target)
+    _replace_and_fsync(recovery, target)
+
+
+def _recover_document(codex_home: Path, document: dict[str, Any]) -> None:
+    _validate_transaction_artifacts(codex_home, document)
+    transaction_id = document["transaction_id"]
+    backup_root = _backup_root_from_document(codex_home, document)
+    targets = {
+        name: codex_home / "skills" / name for name in _SKILL_NAMES
+    }
+    for name in _SKILL_NAMES:
+        entry = document["skills"][name]
+        target = targets[name]
+        retired = _skill_retired(codex_home, name, transaction_id)
+        stage = _skill_stage(codex_home, name, transaction_id)
+        recovery = _skill_recovery(codex_home, name, transaction_id)
+        if entry["original"]:
+            assert backup_root is not None
+            backup = backup_root / "skills" / name
+            if _path_exists(retired):
+                if _path_exists(target):
+                    _remove_path_and_fsync(target)
+                _replace_and_fsync(retired, target)
+            else:
+                _restore_backup(backup, target, recovery)
+        else:
+            if _path_exists(target):
+                _remove_path_and_fsync(target)
+        for path in (stage, retired, recovery):
+            if _path_exists(path):
+                _remove_path_and_fsync(path)
+
+    hooks = document["hooks"]
+    hooks_path = codex_home / "hooks.json"
+    hooks_stage = _hooks_stage(codex_home, transaction_id)
+    hooks_recovery = _hooks_recovery(codex_home, transaction_id)
+    if hooks["replace"]:
+        if hooks["original"]:
+            assert backup_root is not None
+            _restore_backup(
+                backup_root / "hooks.json", hooks_path, hooks_recovery
+            )
+        elif _path_exists(hooks_path):
+            _remove_path_and_fsync(hooks_path)
+    for path in (hooks_stage, hooks_recovery):
+        if _path_exists(path):
+            _remove_path_and_fsync(path)
+
+
+def _recover_unfinished_transaction(codex_home: Path) -> None:
+    document = _read_journal(codex_home)
+    if document is None:
+        return
+    _recover_document(codex_home, document)
+    _clear_journal(codex_home)
+
+
+def _transaction_document(
+    action: str,
+    transaction_id: str,
+    backup_root: Path | None,
+    skill_originals: dict[str, bool],
+    hooks_original: bool,
+    hooks_replace: bool,
+) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "bundle": _BUNDLE_NAME,
+        "action": action,
+        "transaction_id": transaction_id,
+        "backup_id": backup_root.name if backup_root is not None else None,
+        "skills": {
+            name: {
+                "original": skill_originals[name],
+                "install": action == "install",
+            }
+            for name in _SKILL_NAMES
+        },
+        "hooks": {"original": hooks_original, "replace": hooks_replace},
+    }
+
+
+def _cleanup_pretransaction(
+    codex_home: Path,
+    transaction_id: str,
+    backup_root: Path | None,
+) -> None:
+    for name in _SKILL_NAMES:
+        for path in (
+            _skill_stage(codex_home, name, transaction_id),
+            _skill_retired(codex_home, name, transaction_id),
+            _skill_recovery(codex_home, name, transaction_id),
+        ):
+            if _path_exists(path):
+                _remove_path_and_fsync(path)
+    for path in (
+        _hooks_stage(codex_home, transaction_id),
+        _hooks_recovery(codex_home, transaction_id),
+        codex_home / f"{_JOURNAL_NAME}.tmp-{transaction_id}",
+    ):
+        if _path_exists(path):
+            _remove_path_and_fsync(path)
+    if backup_root is not None and _path_exists(backup_root):
+        _remove_path_and_fsync(backup_root)
+
+
+def _prepare_transaction(
+    *,
+    action: str,
+    codex_home: Path,
+    sources: dict[str, Path] | None,
+    targets: dict[str, Path],
+    hooks_path: Path,
+    hooks_document: dict[str, Any],
+    hooks_replace: bool,
+) -> tuple[dict[str, Any], tuple[Path, ...]]:
+    transaction_id = uuid.uuid4().hex
+    skill_originals = {
+        name: _path_exists(target) for name, target in targets.items()
+    }
+    hooks_original = hooks_replace and _path_exists(hooks_path)
+    needs_backup = hooks_original or any(skill_originals.values())
+    backup_root: Path | None = None
+    try:
+        if action == "install":
+            assert sources is not None
+            for name in _SKILL_NAMES:
+                _stage_skill(
+                    sources[name],
+                    targets[name],
+                    _skill_stage(codex_home, name, transaction_id),
+                )
+        if hooks_replace:
+            _stage_hooks(
+                hooks_path,
+                hooks_document,
+                _hooks_stage(codex_home, transaction_id),
+            )
+
+        if needs_backup:
+            backup_root = _create_backup_root(codex_home)
+            if any(skill_originals.values()):
+                _make_directory(backup_root / "skills")
+            for name in _SKILL_NAMES:
+                if skill_originals[name]:
+                    _copy_path_durable(
+                        targets[name], backup_root / "skills" / name
+                    )
+            if hooks_original:
+                _copy_path_durable(hooks_path, backup_root / "hooks.json")
+            _fsync_tree(backup_root)
+            _fsync_directory(backup_root.parent)
+
+        document = _transaction_document(
+            action,
+            transaction_id,
+            backup_root,
+            skill_originals,
+            hooks_original,
+            hooks_replace,
+        )
+        _write_journal(codex_home, document)
+    except BaseException as error:
+        journal_exists = _path_exists(_journal_path(codex_home))
+        rollback_error: Exception | None = None
+        if isinstance(error, Exception) and journal_exists:
+            try:
+                _recover_unfinished_transaction(codex_home)
+            except Exception as caught:
+                rollback_error = caught
+        elif not journal_exists:
+            _cleanup_pretransaction(codex_home, transaction_id, backup_root)
+        if isinstance(error, Exception):
+            detail = f"{action} preparation failed: {error}"
+            if rollback_error is not None:
+                detail += (
+                    "; rollback failed and journal retained: "
+                    f"{rollback_error}"
+                )
+            raise InstallError(detail) from error
+        raise
+
+    backed_up_files: tuple[Path, ...] = ()
+    if backup_root is not None:
+        _, backed_up_files = _planned_backup_from_root(
+            backup_root,
+            {
+                name: backup_root / "skills" / name
+                for name in _SKILL_NAMES
+            },
+            backup_root / "hooks.json",
+        )
+    return document, backed_up_files
+
+
+def _execute_transaction(codex_home: Path, document: dict[str, Any]) -> None:
+    transaction_id = document["transaction_id"]
+    targets = {
+        name: codex_home / "skills" / name for name in _SKILL_NAMES
+    }
+    for name in _SKILL_NAMES:
+        entry = document["skills"][name]
+        target = targets[name]
+        retired = _skill_retired(codex_home, name, transaction_id)
+        if entry["original"]:
+            _replace_and_fsync(target, retired)
+        if entry["install"]:
+            _replace_and_fsync(
+                _skill_stage(codex_home, name, transaction_id), target
+            )
+
+    if document["hooks"]["replace"]:
+        _replace_and_fsync(
+            _hooks_stage(codex_home, transaction_id),
+            codex_home / "hooks.json",
+        )
+
+    for name in _SKILL_NAMES:
+        retired = _skill_retired(codex_home, name, transaction_id)
+        if _path_exists(retired):
+            _remove_path_and_fsync(retired)
+
+
+def _run_transaction(codex_home: Path, document: dict[str, Any]) -> None:
+    try:
+        _execute_transaction(codex_home, document)
+    except Exception as error:
+        rollback_error: Exception | None = None
+        try:
+            _recover_unfinished_transaction(codex_home)
+        except Exception as caught:
+            rollback_error = caught
+        detail = f"{document['action']} failed: {error}"
+        if rollback_error is not None:
+            detail += f"; rollback failed and journal retained: {rollback_error}"
+        raise InstallError(detail) from error
+    try:
+        _clear_journal(codex_home)
+    except Exception as error:
+        raise InstallError(
+            f"{document['action']} committed but journal cleanup failed: {error}"
+        ) from error
 
 
 def install_bundle(
@@ -714,6 +1384,11 @@ def install_bundle(
     changed_paths = tuple([*targets.values(), hooks_path])
     planned_root, planned_files = _planned_backup(codex_home, targets, hooks_path)
     if dry_run:
+        if _path_exists(_journal_path(codex_home)):
+            _read_journal(codex_home)
+            raise InstallError(
+                "unfinished transaction journal requires a non-dry-run recovery"
+            )
         return InstallReport(
             action="install",
             changed_paths=changed_paths,
@@ -723,69 +1398,23 @@ def install_bundle(
         )
 
     _make_directory(codex_home)
-    _make_directory(codex_home / "skills")
-
-    stages: dict[str, Path] = {}
-    hooks_stage: Path | None = None
-    moved_originals: dict[str, Path] = {}
-    installed_names: set[str] = set()
-    hooks_replaced = False
-    hooks_existed = _path_exists(hooks_path)
-    backup_root: Path | None = None
-    backup_hooks: Path | None = None
-    backed_up_files: tuple[Path, ...] = ()
-    try:
-        for name, source in sources.items():
-            stages[name] = _stage_skill(source, targets[name])
-        hooks_stage = _stage_hooks(hooks_path, merged_hooks)
-
-        needs_backup = hooks_existed or any(
-            _path_exists(target) for target in targets.values()
+    with _bundle_lock(codex_home):
+        _recover_unfinished_transaction(codex_home)
+        _make_directory(codex_home / "skills")
+        sources, targets, hooks_path, merged_hooks = _installation_plan(
+            source_root, codex_home
         )
-        backup_root = _create_backup_root(codex_home) if needs_backup else None
-        if backup_root is not None:
-            _make_directory(backup_root / "skills")
-            _, backed_up_files = _planned_backup_from_root(
-                backup_root, targets, hooks_path
-            )
-        if hooks_existed:
-            assert backup_root is not None
-            backup_hooks = backup_root / "hooks.json"
-            shutil.copy2(hooks_path, backup_hooks)
-
-        for name, target in targets.items():
-            if _path_exists(target):
-                assert backup_root is not None
-                backup_target = backup_root / "skills" / name
-                os.replace(target, backup_target)
-                moved_originals[name] = backup_target
-            stage = stages[name]
-            os.replace(stage, target)
-            stages.pop(name)
-            installed_names.add(name)
-
-        assert hooks_stage is not None
-        os.replace(hooks_stage, hooks_path)
-        hooks_stage = None
-        hooks_replaced = True
-    except Exception as error:
-        for stage in stages.values():
-            _remove_path(stage)
-        if hooks_stage is not None:
-            hooks_stage.unlink(missing_ok=True)
-        rollback_failures = _rollback_install(
-            targets,
-            installed_names,
-            moved_originals,
-            hooks_path,
-            hooks_replaced,
-            hooks_existed,
-            backup_hooks,
+        document, backed_up_files = _prepare_transaction(
+            action="install",
+            codex_home=codex_home,
+            sources=sources,
+            targets=targets,
+            hooks_path=hooks_path,
+            hooks_document=merged_hooks,
+            hooks_replace=True,
         )
-        detail = f"installation failed: {error}"
-        if rollback_failures:
-            detail += f"; rollback failed: {'; '.join(rollback_failures)}"
-        raise InstallError(detail) from error
+        backup_root = _backup_root_from_document(codex_home, document)
+        _run_transaction(codex_home, document)
 
     return InstallReport(
         action="install",
@@ -814,22 +1443,13 @@ def uninstall_bundle(codex_home: Path, dry_run: bool) -> InstallReport:
     """Remove only bundle-managed skills and hooks, preserving handoff state."""
 
     codex_home = Path(codex_home).absolute()
-    skills_dir = codex_home / "skills"
-    targets = {name: skills_dir / name for name in _SKILL_NAMES}
-    _validate_managed_paths(codex_home, targets)
-    hooks_path = codex_home / "hooks.json"
-    existing_hooks = _load_hooks(hooks_path)
-    try:
-        remaining_hooks = remove_managed_hooks(existing_hooks)
-    except ValueError as error:
-        raise InstallError(f"cannot update hooks file {hooks_path}: {error}") from error
-    hooks_changed = _path_exists(hooks_path) and remaining_hooks != existing_hooks
-    changed_paths = tuple(
-        [
-            *(target for target in targets.values() if _path_exists(target)),
-            *([hooks_path] if hooks_changed else []),
-        ]
-    )
+    (
+        targets,
+        hooks_path,
+        remaining_hooks,
+        hooks_changed,
+        changed_paths,
+    ) = _uninstallation_plan(codex_home)
     needs_backup = bool(changed_paths)
     planned_root = _next_backup_root(codex_home) if needs_backup else None
     if planned_root is None:
@@ -840,7 +1460,12 @@ def uninstall_bundle(codex_home: Path, dry_run: bool) -> InstallReport:
             targets,
             hooks_path if hooks_changed else codex_home / ".absent-hooks",
         )
-    if dry_run or not needs_backup:
+    if dry_run:
+        if _path_exists(_journal_path(codex_home)):
+            _read_journal(codex_home)
+            raise InstallError(
+                "unfinished transaction journal requires a non-dry-run recovery"
+            )
         return InstallReport(
             action="uninstall",
             changed_paths=changed_paths,
@@ -849,48 +1474,44 @@ def uninstall_bundle(codex_home: Path, dry_run: bool) -> InstallReport:
             dry_run=dry_run,
         )
 
-    hooks_stage = _stage_hooks(hooks_path, remaining_hooks) if hooks_changed else None
-    backup_root: Path | None = None
-    backup_hooks: Path | None = None
-    moved_originals: dict[str, Path] = {}
-    hooks_replaced = False
-    try:
-        backup_root = _create_backup_root(codex_home)
-        _make_directory(backup_root / "skills")
-        _, backed_up_files = _planned_backup_from_root(
-            backup_root,
-            targets,
-            hooks_path if hooks_changed else codex_home / ".absent-hooks",
+    if not needs_backup and not _path_exists(_journal_path(codex_home)):
+        return InstallReport(
+            action="uninstall",
+            changed_paths=changed_paths,
+            backed_up_files=(),
+            backup_root=None,
+            dry_run=False,
         )
-        if hooks_changed:
-            backup_hooks = backup_root / "hooks.json"
-            shutil.copy2(hooks_path, backup_hooks)
-        for name, target in targets.items():
-            if _path_exists(target):
-                backup_target = backup_root / "skills" / name
-                os.replace(target, backup_target)
-                moved_originals[name] = backup_target
-        if hooks_changed:
-            assert hooks_stage is not None
-            os.replace(hooks_stage, hooks_path)
-            hooks_stage = None
-            hooks_replaced = True
-    except Exception as error:
-        if hooks_stage is not None:
-            hooks_stage.unlink(missing_ok=True)
-        rollback_failures = _rollback_install(
+
+    _make_directory(codex_home)
+    with _bundle_lock(codex_home):
+        _recover_unfinished_transaction(codex_home)
+        (
             targets,
-            set(),
-            moved_originals,
             hooks_path,
-            hooks_replaced,
+            remaining_hooks,
             hooks_changed,
-            backup_hooks,
+            changed_paths,
+        ) = _uninstallation_plan(codex_home)
+        if not changed_paths:
+            return InstallReport(
+                action="uninstall",
+                changed_paths=(),
+                backed_up_files=(),
+                backup_root=None,
+                dry_run=False,
+            )
+        document, backed_up_files = _prepare_transaction(
+            action="uninstall",
+            codex_home=codex_home,
+            sources=None,
+            targets=targets,
+            hooks_path=hooks_path,
+            hooks_document=remaining_hooks,
+            hooks_replace=hooks_changed,
         )
-        detail = f"uninstall failed: {error}"
-        if rollback_failures:
-            detail += f"; rollback failed: {'; '.join(rollback_failures)}"
-        raise InstallError(detail) from error
+        backup_root = _backup_root_from_document(codex_home, document)
+        _run_transaction(codex_home, document)
 
     return InstallReport(
         action="uninstall",

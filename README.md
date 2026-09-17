@@ -33,6 +33,21 @@ The four handlers are `Stop`, `UserPromptSubmit`, `PostCompact`, and
 compaction tracking are inactive. Explicit manual confirmation through
 `handoffctl.py confirm` remains available.
 
+Install and uninstall are serialized by a private, persistent bundle lock. If
+another bundle operation is already running, the competing command exits
+without changing either Skill or `hooks.json`; retry it after the first command
+finishes. A dry run creates neither the Codex home, the lock, nor a recovery
+journal.
+
+Before changing an installed target, the installer fsyncs its staged files and
+timestamped backups, then records an identifier-only private transaction
+journal. If a process or machine stops mid-operation, rerun the same non-dry-run
+install or uninstall command: while holding the lock, it first restores the
+pre-operation Skills and Hooks, removes only its validated staging paths, and
+then starts the requested operation. A corrupt, linked, non-private, or
+otherwise invalid lock or journal is rejected for manual inspection instead of
+being followed or deleted.
+
 ## Status
 
 Inspect a pending, completed, or failed handoff with:

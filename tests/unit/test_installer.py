@@ -1,4 +1,5 @@
 import copy
+import fcntl
 import io
 import json
 import os
@@ -26,13 +27,16 @@ def _tree_snapshot(root: Path) -> dict[str, tuple[str, int, bytes | str]]:
     snapshot: dict[str, tuple[str, int, bytes | str]] = {}
     for path in sorted([root, *root.rglob("*")]):
         relative = "." if path == root else str(path.relative_to(root))
-        mode = stat.S_IMODE(path.lstat().st_mode)
+        raw_mode = path.lstat().st_mode
+        mode = stat.S_IMODE(raw_mode)
         if path.is_symlink():
             snapshot[relative] = ("symlink", mode, os.readlink(path))
-        elif path.is_dir():
+        elif stat.S_ISDIR(raw_mode):
             snapshot[relative] = ("directory", mode, b"")
-        else:
+        elif stat.S_ISREG(raw_mode):
             snapshot[relative] = ("file", mode, path.read_bytes())
+        else:
+            snapshot[relative] = ("special", mode, str(stat.S_IFMT(raw_mode)))
     return snapshot
 
 
@@ -1263,7 +1267,7 @@ class InstallerTests(unittest.TestCase):
             },
         }
 
-        result = remove_managed_hooks(existing)
+        result = remove_managed_hooks(existing, self.hook_script)
 
         self.assertEqual(result["description"], "user hooks")
         self.assertEqual(
@@ -1297,7 +1301,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(existing, {"description": "user hooks"})
         self.assertEqual(merged["description"], "user hooks")
         self.assertEqual(set(merged["hooks"]), set(managed["hooks"]))
-        self.assertEqual(remove_managed_hooks(existing), existing)
+        self.assertEqual(remove_managed_hooks(existing, self.hook_script), existing)
 
     def test_non_object_json_is_rejected(self):
         existing = json.loads('[{"hooks": {}}]')
@@ -1306,7 +1310,7 @@ class InstallerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "object"):
             merge_hooks(existing, managed)
         with self.assertRaisesRegex(ValueError, "object"):
-            remove_managed_hooks(existing)
+            remove_managed_hooks(existing, self.hook_script)
 
     def test_invalid_group_or_handler_shape_fails_without_mutation(self):
         malformed_values = [
@@ -1326,7 +1330,7 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(malformed, before)
 
                 with self.assertRaises(ValueError):
-                    remove_managed_hooks(malformed)
+                    remove_managed_hooks(malformed, self.hook_script)
                 self.assertEqual(malformed, before)
 
     def test_invalid_managed_shape_fails_without_mutating_either_input(self):
@@ -1352,6 +1356,596 @@ class InstallerTests(unittest.TestCase):
 
         self.assertEqual(existing, existing_before)
         self.assertEqual(malformed_managed, managed_before)
+
+    def test_merge_and_remove_preserve_non_command_and_unknown_handlers(self):
+        handlers = [
+            {
+                "type": "mcp",
+                "server": "issue-tracker",
+                "tool": "record_event",
+            },
+            {
+                "type": "future-handler",
+                "command": {"structured": "not a shell command"},
+                "options": ["keep", "verbatim"],
+            },
+        ]
+        existing = {
+            "hooks": {
+                "Stop": [
+                    {
+                        "matcher": "all",
+                        "hooks": [
+                            *copy.deepcopy(handlers),
+                            {
+                                "type": "command",
+                                "command": f"python3 {self.hook_script}",
+                            },
+                        ],
+                    }
+                ]
+            }
+        }
+
+        merged = merge_hooks(existing, render_managed_hooks(self.hook_script))
+        removed = remove_managed_hooks(merged, self.hook_script)
+
+        self.assertEqual(removed["hooks"]["Stop"][0]["hooks"], handlers)
+        self.assertEqual(existing["hooks"]["Stop"][0]["hooks"][:2], handlers)
+
+    def test_remove_matches_only_the_exact_selected_codex_home_target(self):
+        exact = Path(
+            "/tmp/selected-home/skills/project-handoff/scripts/handoff_hook.py"
+        )
+        lookalike = Path(
+            "/tmp/other-home/skills/project-handoff/scripts/handoff_hook.py"
+        )
+        existing = {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": f"python3 {exact}",
+                            },
+                            {
+                                "type": "command",
+                                "command": f"python3 {lookalike}",
+                            },
+                        ]
+                    }
+                ]
+            }
+        }
+
+        result = remove_managed_hooks(existing, exact)
+
+        self.assertEqual(
+            result["hooks"]["Stop"][0]["hooks"],
+            [{"type": "command", "command": f"python3 {lookalike}"}],
+        )
+
+    def test_install_fails_without_target_mutation_when_bundle_lock_is_held(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / "codex-home"
+            repo_root = Path(__file__).resolve().parents[2]
+            install_bundle(repo_root, codex_home, dry_run=False)
+            lock_path = codex_home / ".agent-work-boundaries.lock"
+            before = _tree_snapshot(codex_home)
+            descriptor = os.open(lock_path, os.O_RDWR)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaisesRegex(InstallError, "another .* operation"):
+                    install_bundle(repo_root, codex_home, dry_run=False)
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+
+            self.assertEqual(_tree_snapshot(codex_home), before)
+
+    def test_dry_run_creates_neither_lock_nor_journal_in_existing_home(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / "codex-home"
+            codex_home.mkdir()
+            before = _tree_snapshot(codex_home)
+
+            install_bundle(
+                Path(__file__).resolve().parents[2], codex_home, dry_run=True
+            )
+
+            self.assertEqual(_tree_snapshot(codex_home), before)
+            self.assertFalse(
+                (codex_home / ".agent-work-boundaries.lock").exists()
+            )
+            self.assertFalse(
+                (codex_home / ".agent-work-boundaries.transaction.json").exists()
+            )
+
+    def test_install_crashes_after_each_target_replace_and_next_run_recovers(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        for crash_after in range(1, 6):
+            with self.subTest(crash_after=crash_after):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    codex_home = Path(temp_dir) / "codex-home"
+                    install_bundle(repo_root, codex_home, dry_run=False)
+                    marker = (
+                        codex_home
+                        / "skills"
+                        / "project-handoff"
+                        / "pre-crash-marker.txt"
+                    )
+                    marker.write_text("original\n", encoding="utf-8")
+                    real_replace = installer_module._replace_and_fsync
+                    replacements = 0
+
+                    def crash_after_boundary(source, target):
+                        nonlocal replacements
+                        result = real_replace(source, target)
+                        target_path = Path(target)
+                        journal = (
+                            codex_home
+                            / ".agent-work-boundaries.transaction.json"
+                        )
+                        is_target_boundary = target_path == codex_home / "hooks.json" or (
+                            target_path.parent == codex_home / "skills"
+                            and (
+                                target_path.name in {
+                                    "project-handoff",
+                                    "task-router",
+                                }
+                                or ".retired-" in target_path.name
+                            )
+                        )
+                        if journal.exists() and is_target_boundary:
+                            replacements += 1
+                            if replacements == crash_after:
+                                raise SystemExit("simulated process crash")
+                        return result
+
+                    with patch.object(
+                        installer_module,
+                        "_replace_and_fsync",
+                        side_effect=crash_after_boundary,
+                    ):
+                        with self.assertRaisesRegex(
+                            SystemExit, "simulated process crash"
+                        ):
+                            install_bundle(repo_root, codex_home, dry_run=False)
+
+                    self.assertTrue(
+                        (
+                            codex_home
+                            / ".agent-work-boundaries.transaction.json"
+                        ).is_file()
+                    )
+                    report = install_bundle(repo_root, codex_home, dry_run=False)
+                    self.assertEqual(report.action, "install")
+                    self.assertFalse(
+                        (
+                            codex_home
+                            / ".agent-work-boundaries.transaction.json"
+                        ).exists()
+                    )
+                    self.assertFalse(
+                        any(
+                            ".retired-" in path.name or ".stage-" in path.name
+                            for path in codex_home.rglob("*")
+                        )
+                    )
+
+    def test_first_install_crashes_after_each_replace_and_next_run_recovers(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        for crash_after in range(1, 4):
+            with self.subTest(crash_after=crash_after):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    codex_home = Path(temp_dir) / "codex-home"
+                    real_replace = installer_module._replace_and_fsync
+                    replacements = 0
+
+                    def crash_after_boundary(source, target):
+                        nonlocal replacements
+                        result = real_replace(source, target)
+                        target_path = Path(target)
+                        journal = (
+                            codex_home
+                            / ".agent-work-boundaries.transaction.json"
+                        )
+                        is_target_boundary = target_path == codex_home / "hooks.json" or (
+                            target_path.parent == codex_home / "skills"
+                            and target_path.name
+                            in {"project-handoff", "task-router"}
+                        )
+                        if journal.exists() and is_target_boundary:
+                            replacements += 1
+                            if replacements == crash_after:
+                                raise SystemExit("simulated first-install crash")
+                        return result
+
+                    with patch.object(
+                        installer_module,
+                        "_replace_and_fsync",
+                        side_effect=crash_after_boundary,
+                    ):
+                        with self.assertRaisesRegex(
+                            SystemExit, "first-install crash"
+                        ):
+                            install_bundle(repo_root, codex_home, dry_run=False)
+
+                    report = install_bundle(repo_root, codex_home, dry_run=False)
+
+                    self.assertEqual(report.action, "install")
+                    self.assertTrue(
+                        (
+                            codex_home
+                            / "skills"
+                            / "project-handoff"
+                            / "SKILL.md"
+                        ).is_file()
+                    )
+                    self.assertFalse(
+                        (
+                            codex_home
+                            / ".agent-work-boundaries.transaction.json"
+                        ).exists()
+                    )
+
+    def test_uninstall_crashes_after_each_target_replace_and_next_run_recovers(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        for crash_after in range(1, 4):
+            with self.subTest(crash_after=crash_after):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    codex_home = Path(temp_dir) / "codex-home"
+                    install_bundle(repo_root, codex_home, dry_run=False)
+                    real_replace = installer_module._replace_and_fsync
+                    replacements = 0
+
+                    def crash_after_boundary(source, target):
+                        nonlocal replacements
+                        result = real_replace(source, target)
+                        target_path = Path(target)
+                        journal = (
+                            codex_home
+                            / ".agent-work-boundaries.transaction.json"
+                        )
+                        is_target_boundary = target_path == codex_home / "hooks.json" or (
+                            target_path.parent == codex_home / "skills"
+                            and ".retired-" in target_path.name
+                        )
+                        if journal.exists() and is_target_boundary:
+                            replacements += 1
+                            if replacements == crash_after:
+                                raise SystemExit("simulated process crash")
+                        return result
+
+                    with patch.object(
+                        installer_module,
+                        "_replace_and_fsync",
+                        side_effect=crash_after_boundary,
+                    ):
+                        with self.assertRaisesRegex(
+                            SystemExit, "simulated process crash"
+                        ):
+                            installer_module.uninstall_bundle(
+                                codex_home, dry_run=False
+                            )
+
+                    self.assertTrue(
+                        (
+                            codex_home
+                            / ".agent-work-boundaries.transaction.json"
+                        ).is_file()
+                    )
+                    report = installer_module.uninstall_bundle(
+                        codex_home, dry_run=False
+                    )
+                    self.assertEqual(report.action, "uninstall")
+                    self.assertFalse(
+                        (codex_home / "skills" / "project-handoff").exists()
+                    )
+                    self.assertFalse(
+                        (codex_home / "skills" / "task-router").exists()
+                    )
+                    self.assertFalse(
+                        (
+                            codex_home
+                            / ".agent-work-boundaries.transaction.json"
+                        ).exists()
+                    )
+
+    def test_recovery_restores_originals_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / "codex-home"
+            repo_root = Path(__file__).resolve().parents[2]
+            install_bundle(repo_root, codex_home, dry_run=False)
+            marker = (
+                codex_home / "skills" / "project-handoff" / "original.txt"
+            )
+            marker.write_text("restore exactly\n", encoding="utf-8")
+            expected_skills = _tree_snapshot(codex_home / "skills")
+            expected_hooks = (codex_home / "hooks.json").read_bytes()
+            real_replace = installer_module._replace_and_fsync
+            replacements = 0
+
+            def crash_second_target_replace(source, target):
+                nonlocal replacements
+                result = real_replace(source, target)
+                target_path = Path(target)
+                journal = codex_home / ".agent-work-boundaries.transaction.json"
+                if journal.exists() and target_path.parent == codex_home / "skills":
+                    replacements += 1
+                    if replacements == 2:
+                        raise SystemExit("crash")
+                return result
+
+            with patch.object(
+                installer_module,
+                "_replace_and_fsync",
+                side_effect=crash_second_target_replace,
+            ):
+                with self.assertRaises(SystemExit):
+                    install_bundle(repo_root, codex_home, dry_run=False)
+
+            with installer_module._bundle_lock(codex_home):
+                installer_module._recover_unfinished_transaction(codex_home)
+                installer_module._recover_unfinished_transaction(codex_home)
+
+            self.assertEqual(_tree_snapshot(codex_home / "skills"), expected_skills)
+            self.assertEqual((codex_home / "hooks.json").read_bytes(), expected_hooks)
+            self.assertFalse(
+                (codex_home / ".agent-work-boundaries.transaction.json").exists()
+            )
+
+    def test_corrupt_and_traversal_journals_are_rejected_without_target_changes(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        payloads = (
+            b"{not json\n",
+            json.dumps(
+                {
+                    "version": 1,
+                    "bundle": "agent-work-boundaries",
+                    "action": "install",
+                    "transaction_id": "../escape",
+                    "backup_id": None,
+                    "skills": {
+                        "project-handoff": {"original": False, "install": True},
+                        "task-router": {"original": False, "install": True},
+                    },
+                    "hooks": {"original": False, "replace": True},
+                }
+            ).encode(),
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload[:20]):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    codex_home = Path(temp_dir) / "codex-home"
+                    install_bundle(repo_root, codex_home, dry_run=False)
+                    journal = (
+                        codex_home
+                        / ".agent-work-boundaries.transaction.json"
+                    )
+                    journal.write_bytes(payload)
+                    journal.chmod(0o600)
+                    expected_skills = _tree_snapshot(codex_home / "skills")
+                    expected_hooks = (codex_home / "hooks.json").read_bytes()
+
+                    with self.assertRaisesRegex(InstallError, "journal"):
+                        install_bundle(repo_root, codex_home, dry_run=False)
+
+                    self.assertEqual(
+                        _tree_snapshot(codex_home / "skills"), expected_skills
+                    )
+                    self.assertEqual(
+                        (codex_home / "hooks.json").read_bytes(), expected_hooks
+                    )
+
+    def test_install_and_uninstall_preserve_non_command_handlers_end_to_end(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / "codex-home"
+            codex_home.mkdir()
+            non_command = {
+                "type": "mcp",
+                "server": "audit",
+                "tool": "record",
+                "arguments": {"scope": "hooks"},
+            }
+            hooks_path = codex_home / "hooks.json"
+            hooks_path.write_text(
+                json.dumps(
+                    {"hooks": {"Stop": [{"hooks": [non_command]}]}}
+                ),
+                encoding="utf-8",
+            )
+            repo_root = Path(__file__).resolve().parents[2]
+
+            install_bundle(repo_root, codex_home, dry_run=False)
+            installed = json.loads(hooks_path.read_text(encoding="utf-8"))
+            installer_module.uninstall_bundle(codex_home, dry_run=False)
+            uninstalled = json.loads(hooks_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(installed["hooks"]["Stop"][0]["hooks"], [non_command])
+            self.assertEqual(uninstalled["hooks"]["Stop"][0]["hooks"], [non_command])
+
+    def test_symlink_and_special_journals_are_rejected_without_following(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        for kind in ("symlink", "fifo"):
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    codex_home = temp_root / "codex-home"
+                    install_bundle(repo_root, codex_home, dry_run=False)
+                    journal = (
+                        codex_home
+                        / ".agent-work-boundaries.transaction.json"
+                    )
+                    outside = temp_root / "outside-journal"
+                    outside.write_text("do not read\n", encoding="utf-8")
+                    if kind == "symlink":
+                        journal.symlink_to(outside)
+                    else:
+                        os.mkfifo(journal)
+                    expected_skills = _tree_snapshot(codex_home / "skills")
+                    outside_before = outside.read_bytes()
+
+                    with self.assertRaisesRegex(InstallError, "journal"):
+                        installer_module.uninstall_bundle(
+                            codex_home, dry_run=False
+                        )
+
+                    self.assertEqual(
+                        _tree_snapshot(codex_home / "skills"), expected_skills
+                    )
+                    self.assertEqual(outside.read_bytes(), outside_before)
+
+    def test_symlink_and_special_lock_files_are_rejected_without_following(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        for kind in ("symlink", "fifo"):
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    codex_home = temp_root / "codex-home"
+                    codex_home.mkdir()
+                    lock = codex_home / ".agent-work-boundaries.lock"
+                    outside = temp_root / "outside-lock"
+                    outside.write_text("do not touch\n", encoding="utf-8")
+                    if kind == "symlink":
+                        lock.symlink_to(outside)
+                    else:
+                        os.mkfifo(lock)
+                    before = _tree_snapshot(codex_home)
+
+                    with self.assertRaisesRegex(InstallError, "lock"):
+                        install_bundle(repo_root, codex_home, dry_run=False)
+
+                    self.assertEqual(_tree_snapshot(codex_home), before)
+                    self.assertEqual(outside.read_text(), "do not touch\n")
+
+    def test_directory_fsync_failure_rolls_back_and_clears_journal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / "codex-home"
+            repo_root = Path(__file__).resolve().parents[2]
+            install_bundle(repo_root, codex_home, dry_run=False)
+            marker = codex_home / "skills" / "task-router" / "original.txt"
+            marker.write_text("keep\n", encoding="utf-8")
+            expected_skills = _tree_snapshot(codex_home / "skills")
+            expected_hooks = (codex_home / "hooks.json").read_bytes()
+            real_fsync_directory = installer_module._fsync_directory
+            failed = False
+
+            def fail_once_after_journal(path):
+                nonlocal failed
+                if (
+                    not failed
+                    and Path(path) == codex_home / "skills"
+                    and (
+                        codex_home
+                        / ".agent-work-boundaries.transaction.json"
+                    ).exists()
+                ):
+                    failed = True
+                    raise OSError("simulated directory fsync failure")
+                return real_fsync_directory(path)
+
+            with patch.object(
+                installer_module,
+                "_fsync_directory",
+                side_effect=fail_once_after_journal,
+            ):
+                with self.assertRaisesRegex(
+                    InstallError, "directory fsync failure"
+                ):
+                    install_bundle(repo_root, codex_home, dry_run=False)
+
+            self.assertTrue(failed)
+            self.assertEqual(_tree_snapshot(codex_home / "skills"), expected_skills)
+            self.assertEqual((codex_home / "hooks.json").read_bytes(), expected_hooks)
+            self.assertFalse(
+                (codex_home / ".agent-work-boundaries.transaction.json").exists()
+            )
+
+    def test_journal_unlink_fsync_failure_reinstates_recovery_record(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / "codex-home"
+            repo_root = Path(__file__).resolve().parents[2]
+            install_bundle(repo_root, codex_home, dry_run=False)
+            journal = codex_home / ".agent-work-boundaries.transaction.json"
+            real_fsync_directory = installer_module._fsync_directory
+            failed = False
+            saw_journal = False
+
+            def fail_once_after_journal_unlink(path):
+                nonlocal failed, saw_journal
+                if journal.exists():
+                    saw_journal = True
+                if (
+                    saw_journal
+                    and not failed
+                    and Path(path) == codex_home
+                    and not journal.exists()
+                ):
+                    failed = True
+                    raise OSError("simulated journal unlink fsync failure")
+                return real_fsync_directory(path)
+
+            with patch.object(
+                installer_module,
+                "_fsync_directory",
+                side_effect=fail_once_after_journal_unlink,
+            ):
+                with self.assertRaisesRegex(
+                    InstallError, "journal cleanup failed"
+                ):
+                    install_bundle(repo_root, codex_home, dry_run=False)
+
+            self.assertTrue(failed)
+            self.assertTrue(journal.is_file())
+
+            report = install_bundle(repo_root, codex_home, dry_run=False)
+
+            self.assertEqual(report.action, "install")
+            self.assertFalse(journal.exists())
+
+    def test_failed_rollback_retains_journal_for_next_startup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / "codex-home"
+            repo_root = Path(__file__).resolve().parents[2]
+            install_bundle(repo_root, codex_home, dry_run=False)
+            journal = codex_home / ".agent-work-boundaries.transaction.json"
+            real_replace = os.replace
+            failed_commit = False
+
+            def fail_hooks_commit(source, target):
+                nonlocal failed_commit
+                source_path = Path(source)
+                target_path = Path(target)
+                if (
+                    not failed_commit
+                    and target_path == codex_home / "hooks.json"
+                    and source_path.name.startswith(".hooks.json.stage-")
+                ):
+                    failed_commit = True
+                    raise OSError("simulated commit failure")
+                return real_replace(source, target)
+
+            with patch.object(
+                installer_module.os, "replace", side_effect=fail_hooks_commit
+            ), patch.object(
+                installer_module,
+                "_recover_document",
+                side_effect=OSError("simulated rollback failure"),
+            ):
+                with self.assertRaisesRegex(
+                    InstallError, "rollback failed and journal retained"
+                ):
+                    install_bundle(repo_root, codex_home, dry_run=False)
+
+            self.assertTrue(failed_commit)
+            self.assertTrue(journal.is_file())
+
+            report = install_bundle(repo_root, codex_home, dry_run=False)
+
+            self.assertEqual(report.action, "install")
+            self.assertFalse(journal.exists())
 
 
 if __name__ == "__main__":
