@@ -1,6 +1,7 @@
 import io
 import json
 from pathlib import Path
+import queue
 import subprocess
 import sys
 import threading
@@ -47,6 +48,19 @@ class BlockingInput(RecordingInput):
     def close(self):
         self.release_write.set()
         super().close()
+
+
+class FailingInput(RecordingInput):
+    def __init__(self, fail_on_write):
+        super().__init__()
+        self._fail_on_write = fail_on_write
+        self._write_count = 0
+
+    def write(self, value):
+        self._write_count += 1
+        if self._write_count == self._fail_on_write:
+            raise BrokenPipeError("proxy input closed")
+        return super().write(value)
 
 
 class TrackedStringIO(io.StringIO):
@@ -359,6 +373,217 @@ class AppServerClientTests(unittest.TestCase):
         ]
         self.assertEqual(methods, ["initialize", "initialized"])
         self.assert_proxy_cleaned_up(process)
+
+    def test_target_serialization_failure_is_definitely_unsent(self):
+        operations = (
+            (
+                "thread/start",
+                lambda client, callback: client.start_thread(
+                    "/workspace/repo",
+                    before_send=callback,
+                ),
+            ),
+            (
+                "turn/start",
+                lambda client, callback: client.start_turn(
+                    "thr-new",
+                    "resume from the handoff",
+                    "project-handoff:pending-123",
+                    before_send=callback,
+                ),
+            ),
+        )
+        real_dumps = json.dumps
+
+        for target_method, operation in operations:
+            with self.subTest(method=target_method):
+                process = FakeProcess(
+                    [{"id": 1, "result": {"capabilities": {}}}]
+                )
+                callbacks = []
+
+                def fail_target(message):
+                    if message.get("method") == target_method:
+                        raise TypeError("not serializable")
+                    return real_dumps(message)
+
+                with mock.patch.object(
+                    app_server_client.json,
+                    "dumps",
+                    side_effect=fail_target,
+                ):
+                    with self.assertRaises(
+                        app_server_client.AppServerError
+                    ) as raised:
+                        operation(
+                            self.make_client(process),
+                            lambda: callbacks.append("persisted"),
+                        )
+
+                self.assertEqual(callbacks, ["persisted"])
+                self.assertFalse(
+                    raised.exception.request_may_have_been_sent
+                )
+                methods = [
+                    json.loads(line)["method"]
+                    for line in process.stdin.getvalue().splitlines()
+                ]
+                self.assertEqual(methods, ["initialize", "initialized"])
+                self.assert_proxy_cleaned_up(process)
+
+    def test_target_writer_timeout_is_conservatively_sent(self):
+        operations = (
+            (
+                "thread/start",
+                lambda client, callback: client.start_thread(
+                    "/workspace/repo",
+                    before_send=callback,
+                ),
+            ),
+            (
+                "turn/start",
+                lambda client, callback: client.start_turn(
+                    "thr-new",
+                    "resume from the handoff",
+                    "project-handoff:pending-123",
+                    before_send=callback,
+                ),
+            ),
+        )
+
+        for target_method, operation in operations:
+            with self.subTest(method=target_method):
+                process = FakeProcess(
+                    [{"id": 1, "result": {"capabilities": {}}}]
+                )
+                process.stdin = BlockingInput(block_on_write=3)
+                callback_called = threading.Event()
+                outcome = []
+
+                def run_operation():
+                    try:
+                        operation(
+                            self.make_client(process, request_timeout=0.01),
+                            callback_called.set,
+                        )
+                    except BaseException as error:
+                        outcome.append(error)
+
+                worker = threading.Thread(target=run_operation, daemon=True)
+                worker.start()
+                self.assertTrue(callback_called.wait(timeout=1))
+                self.assertTrue(process.stdin.write_entered.wait(timeout=1))
+                worker.join(timeout=1)
+                if worker.is_alive():
+                    process.stdin.release_write.set()
+                    worker.join(timeout=1)
+
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(len(outcome), 1)
+                self.assertIsInstance(
+                    outcome[0],
+                    app_server_client.AppServerError,
+                )
+                self.assertRegex(str(outcome[0]), f"{target_method}.*timed out")
+                self.assertTrue(outcome[0].request_may_have_been_sent)
+                self.assert_proxy_cleaned_up(process)
+
+    def test_pre_queue_deadline_and_queue_failures_are_definitely_unsent(self):
+        cases = (
+            (
+                "deadline",
+                queue.Queue(),
+                11.0,
+            ),
+            (
+                "queue",
+                mock.Mock(
+                    put=mock.Mock(side_effect=RuntimeError("queue closed"))
+                ),
+                9.0,
+            ),
+        )
+
+        for label, writes, now in cases:
+            with self.subTest(failure=label), mock.patch.object(
+                app_server_client.time,
+                "monotonic",
+                return_value=now,
+            ):
+                with self.assertRaises(
+                    app_server_client.AppServerError
+                ) as raised:
+                    AppServerClient._send(
+                        writes,
+                        {
+                            "id": 2,
+                            "method": "thread/start",
+                            "params": {"cwd": "/workspace/repo"},
+                        },
+                        deadline=10.0,
+                    )
+
+            self.assertFalse(raised.exception.request_may_have_been_sent)
+            if label == "deadline":
+                self.assertTrue(writes.empty())
+
+    def test_target_writer_error_is_conservatively_sent(self):
+        process = FakeProcess(
+            [{"id": 1, "result": {"capabilities": {}}}]
+        )
+        process.stdin = FailingInput(fail_on_write=3)
+        client = self.make_client(process)
+
+        with self.assertRaises(app_server_client.AppServerError) as raised:
+            client.start_thread(
+                "/workspace/repo",
+                before_send=lambda: None,
+            )
+
+        self.assertRegex(str(raised.exception), "thread/start.*could not be sent")
+        self.assertTrue(raised.exception.request_may_have_been_sent)
+        self.assert_proxy_cleaned_up(process)
+
+    def test_target_response_failures_are_conservatively_sent(self):
+        initialize = json.dumps(
+            {"id": 1, "result": {"capabilities": {}}}
+        ) + "\n"
+        cases = (
+            ("eof", initialize, "proxy closed"),
+            ("invalid", initialize + "not-json\n", "invalid JSON"),
+            (
+                "error",
+                initialize
+                + json.dumps(
+                    {
+                        "id": 2,
+                        "error": {"code": -32000, "message": "private"},
+                    }
+                )
+                + "\n",
+                "returned an error",
+            ),
+        )
+
+        for label, stdout, expected in cases:
+            with self.subTest(failure=label):
+                process = FakeProcess(stdout=TrackedStringIO(stdout))
+                client = self.make_client(process)
+
+                with self.assertRaisesRegex(
+                    app_server_client.AppServerError,
+                    expected,
+                ) as raised:
+                    client.start_thread(
+                        "/workspace/repo",
+                        before_send=lambda: None,
+                    )
+
+                self.assertTrue(
+                    raised.exception.request_may_have_been_sent
+                )
+                self.assertNotIn("private", str(raised.exception))
+                self.assert_proxy_cleaned_up(process)
 
     def test_split_operation_preserves_worker_start_failure_and_cleans_up(self):
         process = FakeProcess()
@@ -716,12 +941,13 @@ class AppServerClientTests(unittest.TestCase):
         with self.assertRaisesRegex(
             app_server_client.AppServerError,
             "thread/start.*thread id",
-        ):
+        ) as raised:
             client.start_thread(
                 "/workspace/repo",
                 before_send=lambda: None,
             )
 
+        self.assertTrue(raised.exception.request_may_have_been_sent)
         self.assert_proxy_cleaned_up(process)
 
     def test_start_turn_rejects_missing_turn_id(self):
@@ -787,6 +1013,7 @@ class AppServerClientTests(unittest.TestCase):
         self.assertEqual(len(outcome), 1)
         self.assertIsInstance(outcome[0], app_server_client.AppServerError)
         self.assertRegex(str(outcome[0]), "thread/start.*timed out")
+        self.assertTrue(outcome[0].request_may_have_been_sent)
         self.assert_proxy_cleaned_up(process)
 
     def test_thread_notifications_do_not_consume_response_ids(self):

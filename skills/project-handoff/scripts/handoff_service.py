@@ -10,6 +10,8 @@ import sys
 import tempfile
 import time
 
+from app_server_client import AppServerError
+
 
 _REQUIRED_SECTIONS = (
     "Completed Work",
@@ -160,11 +162,18 @@ class HandoffService:
             )
         except Exception as error:
             if callback_completed:
-                self._mark_indeterminate_without_masking(
-                    pending_id,
-                    error,
-                    prompt,
-                )
+                if self._request_definitely_unsent(error):
+                    self._mark_thread_unsent_without_masking(
+                        pending_id,
+                        error,
+                        prompt,
+                    )
+                else:
+                    self._mark_indeterminate_without_masking(
+                        pending_id,
+                        error,
+                        prompt,
+                    )
             else:
                 self._mark_failed_without_masking(record, error, prompt)
             raise
@@ -207,11 +216,18 @@ class HandoffService:
             )
         except Exception as error:
             if callback_completed:
-                self._mark_indeterminate_without_masking(
-                    pending_id,
-                    error,
-                    prompt,
-                )
+                if self._request_definitely_unsent(error):
+                    self._mark_turn_unsent_without_masking(
+                        pending_id,
+                        error,
+                        prompt,
+                    )
+                else:
+                    self._mark_indeterminate_without_masking(
+                        pending_id,
+                        error,
+                        prompt,
+                    )
             raise
 
         # If this write fails, turn_starting remains durable and non-reclaimable.
@@ -255,6 +271,43 @@ class HandoffService:
             )
         except Exception:
             pass
+
+    def _mark_thread_unsent_without_masking(
+        self,
+        pending_id,
+        error,
+        recovery_prompt,
+    ):
+        try:
+            self.store.mark_thread_unsent_failed(
+                pending_id,
+                self._error_summary(error),
+                recovery_prompt,
+            )
+        except Exception:
+            pass
+
+    def _mark_turn_unsent_without_masking(
+        self,
+        pending_id,
+        error,
+        recovery_prompt,
+    ):
+        try:
+            self.store.mark_turn_unsent(
+                pending_id,
+                self._error_summary(error),
+                recovery_prompt,
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _request_definitely_unsent(error):
+        return (
+            isinstance(error, AppServerError)
+            and error.request_may_have_been_sent is False
+        )
 
     @staticmethod
     def _client_user_message_id(pending_id):

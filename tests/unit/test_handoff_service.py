@@ -114,6 +114,56 @@ class AmbiguousTurnClient(RecordingClient):
         raise AppServerError("turn/start failed because the proxy closed")
 
 
+class DefinitelyUnsentThreadClient(RecordingClient):
+    def start_thread(self, cwd: str, before_send):
+        before_send()
+        self.thread_calls.append(cwd)
+        raise AppServerError(
+            "thread/start failed before queueing",
+            request_may_have_been_sent=False,
+        )
+
+
+class DefinitelyUnsentTurnClient(RecordingClient):
+    def start_turn(
+        self,
+        thread_id: str,
+        prompt: str,
+        client_user_message_id: str,
+        before_send,
+    ):
+        before_send()
+        self.turn_calls.append(
+            (thread_id, prompt, client_user_message_id)
+        )
+        raise AppServerError(
+            "turn/start failed before queueing",
+            request_may_have_been_sent=False,
+        )
+
+
+class UnknownThreadFailureClient(RecordingClient):
+    def start_thread(self, cwd: str, before_send):
+        before_send()
+        self.thread_calls.append(cwd)
+        raise RuntimeError("unknown thread failure")
+
+
+class UnknownTurnFailureClient(RecordingClient):
+    def start_turn(
+        self,
+        thread_id: str,
+        prompt: str,
+        client_user_message_id: str,
+        before_send,
+    ):
+        before_send()
+        self.turn_calls.append(
+            (thread_id, prompt, client_user_message_id)
+        )
+        raise RuntimeError("unknown turn failure")
+
+
 class FailTurnBeforeSendOnceClient(RecordingClient):
     def __init__(self):
         super().__init__()
@@ -551,6 +601,122 @@ class HandoffServiceTests(unittest.TestCase):
         self.assertIsNone(service.confirm(pending_id))
         self.assertEqual(client.thread_calls, [str(self.root)])
         self.assertEqual(len(client.turn_calls), 1)
+
+    def test_definitely_unsent_thread_start_returns_to_retryable_failed(self):
+        service, client, _clock = self.make_service(
+            client=DefinitelyUnsentThreadClient()
+        )
+        pending_id, _target = self.prepare_armed(service)
+
+        with self.assertRaisesRegex(AppServerError, "before queueing"):
+            service.confirm(pending_id)
+
+        status = service.status("thr-old")
+        self.assertEqual(status["state"], "failed")
+        self.assertTrue(status["retryable"])
+        self.assertEqual(status["request_outcome"], "definitely_unsent")
+        self.assertNotEqual(status["state"], "indeterminate")
+        self.assertEqual(client.thread_calls, [str(self.root)])
+        self.assertEqual(client.turn_calls, [])
+
+    def test_definitely_unsent_turn_start_remains_safely_resumable(self):
+        service, client, _clock = self.make_service(
+            client=DefinitelyUnsentTurnClient()
+        )
+        pending_id, _target = self.prepare_armed(service)
+
+        with self.assertRaisesRegex(AppServerError, "before queueing"):
+            service.confirm(pending_id)
+
+        status = service.status("thr-old")
+        self.assertEqual(status["state"], "thread_created")
+        self.assertEqual(status["new_thread_id"], "thr-new")
+        self.assertTrue(status["retryable"])
+        self.assertEqual(status["recovery_mode"], "resume_turn_only")
+        self.assertEqual(status["request_outcome"], "definitely_unsent")
+        self.assertNotEqual(status["state"], "indeterminate")
+        self.assertEqual(client.thread_calls, [str(self.root)])
+        self.assertEqual(len(client.turn_calls), 1)
+
+    def test_unsent_rollback_persistence_failure_remains_non_reclaimable(self):
+        cases = (
+            (
+                "thread",
+                DefinitelyUnsentThreadClient(),
+                "mark_thread_unsent_failed",
+                "thread_starting",
+            ),
+            (
+                "turn",
+                DefinitelyUnsentTurnClient(),
+                "mark_turn_unsent",
+                "turn_starting",
+            ),
+        )
+
+        for label, client, store_method, expected_state in cases:
+            with self.subTest(operation=label):
+                case_root = self.root / label
+                clock = FakeClock()
+                service = HandoffService(
+                    store=StateStore(case_root / "state", now=clock.now),
+                    app_server_client=client,
+                    private_handoff_dir=case_root / "private",
+                    sleeper=clock.sleep,
+                )
+                pending_id = service.prepare(
+                    case_root,
+                    VALID_HANDOFF,
+                    case_root / "docs" / "AI-HANDOFF.md",
+                )
+                service.arm(pending_id, "thr-old", 300)
+
+                with mock.patch.object(
+                    service.store,
+                    store_method,
+                    side_effect=OSError("rollback persistence failed"),
+                ):
+                    with self.assertRaisesRegex(
+                        AppServerError,
+                        "before queueing",
+                    ):
+                        service.confirm(pending_id)
+
+                status = service.status("thr-old")
+                self.assertEqual(status["state"], expected_state)
+                self.assertFalse(status["retryable"])
+                self.assertIsNone(service.confirm(pending_id))
+
+    def test_unknown_post_callback_failures_are_conservatively_indeterminate(self):
+        cases = (
+            ("thread", UnknownThreadFailureClient(), "thread_starting"),
+            ("turn", UnknownTurnFailureClient(), "turn_starting"),
+        )
+
+        for label, client, external_phase in cases:
+            with self.subTest(operation=label):
+                case_root = self.root / f"unknown-{label}"
+                clock = FakeClock()
+                service = HandoffService(
+                    store=StateStore(case_root / "state", now=clock.now),
+                    app_server_client=client,
+                    private_handoff_dir=case_root / "private",
+                    sleeper=clock.sleep,
+                )
+                pending_id = service.prepare(
+                    case_root,
+                    VALID_HANDOFF,
+                    case_root / "docs" / "AI-HANDOFF.md",
+                )
+                service.arm(pending_id, "thr-old", 300)
+
+                with self.assertRaisesRegex(RuntimeError, "unknown"):
+                    service.confirm(pending_id)
+
+                status = service.status("thr-old")
+                self.assertEqual(status["state"], "indeterminate")
+                self.assertEqual(status["external_phase"], external_phase)
+                self.assertFalse(status["retryable"])
 
     def test_thread_id_persistence_failure_keeps_non_reclaimable_phase(self):
         service, client, _clock = self.make_service()

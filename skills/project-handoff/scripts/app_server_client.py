@@ -10,7 +10,11 @@ _STDERR_CAPTURE_LIMIT = 4096
 
 
 class AppServerError(RuntimeError):
-    pass
+    def __init__(self, message, *, request_may_have_been_sent=True):
+        super().__init__(message)
+        self.request_may_have_been_sent = bool(
+            request_may_have_been_sent
+        )
 
 
 class _BoundedCapture:
@@ -177,20 +181,26 @@ class AppServerClient:
             )
         except subprocess.TimeoutExpired:
             raise AppServerError(
-                "app server daemon timed out while starting"
+                "app server daemon timed out while starting",
+                request_may_have_been_sent=False,
             ) from None
         except subprocess.CalledProcessError as error:
             raise AppServerError(
                 "app server daemon failed to start "
-                f"with exit status {error.returncode}"
+                f"with exit status {error.returncode}",
+                request_may_have_been_sent=False,
             ) from None
         except (OSError, RuntimeError):
-            raise AppServerError("app server daemon failed to start") from None
+            raise AppServerError(
+                "app server daemon failed to start",
+                request_may_have_been_sent=False,
+            ) from None
         returncode = getattr(result, "returncode", 0)
         if returncode:
             raise AppServerError(
                 "app server daemon failed to start "
-                f"with exit status {returncode}"
+                f"with exit status {returncode}",
+                request_may_have_been_sent=False,
             )
 
     def _start_proxy(self):
@@ -204,13 +214,19 @@ class AppServerClient:
                 bufsize=1,
             )
         except (OSError, RuntimeError):
-            raise AppServerError("app server proxy failed to start") from None
+            raise AppServerError(
+                "app server proxy failed to start",
+                request_may_have_been_sent=False,
+            ) from None
         return process
 
     @staticmethod
     def _validate_proxy_streams(process):
         if process.stdin is None or process.stdout is None or process.stderr is None:
-            raise AppServerError("app server proxy streams are unavailable")
+            raise AppServerError(
+                "app server proxy streams are unavailable",
+                request_may_have_been_sent=False,
+            )
 
     def _request(
         self,
@@ -284,20 +300,33 @@ class AppServerClient:
 
     @staticmethod
     def _send(writes, message, deadline):
-        payload = json.dumps(message) + "\n"
+        method = message.get("method", "request")
+        try:
+            payload = json.dumps(message) + "\n"
+        except (TypeError, ValueError, OverflowError):
+            raise AppServerError(
+                f"{method} could not be serialized",
+                request_may_have_been_sent=False,
+            ) from None
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            method = message.get("method", "request")
-            raise AppServerError(f"{method} timed out while sending")
+            raise AppServerError(
+                f"{method} timed out before queueing",
+                request_may_have_been_sent=False,
+            )
         completion = queue.Queue(maxsize=1)
-        writes.put((payload, completion))
+        try:
+            writes.put((payload, completion))
+        except Exception:
+            raise AppServerError(
+                f"{method} could not be queued",
+                request_may_have_been_sent=False,
+            ) from None
         try:
             error = completion.get(timeout=remaining)
         except queue.Empty:
-            method = message.get("method", "request")
             raise AppServerError(f"{method} timed out while sending") from None
         if error is not None:
-            method = message.get("method", "request")
             raise AppServerError(f"{method} could not be sent to the proxy")
 
     @staticmethod

@@ -18,9 +18,9 @@ LEGAL_TRANSITIONS = {
     "responded": {"transferring", "cancelled"},
     "expired": {"transferring"},
     "transferring": {"thread_starting", "failed"},
-    "thread_starting": {"thread_created", "indeterminate"},
+    "thread_starting": {"thread_created", "failed", "indeterminate"},
     "thread_created": {"turn_starting"},
-    "turn_starting": {"transferred", "indeterminate"},
+    "turn_starting": {"thread_created", "transferred", "indeterminate"},
     "failed": {"transferring", "cancelled"},
     "indeterminate": set(),
     "transferred": set(),
@@ -206,6 +206,42 @@ class StateStore:
             record["error_summary"] = error_summary
             record["recovery_prompt"] = recovery_prompt
             record["indeterminate_at"] = self.now()
+            self._persist(record)
+            return record
+
+    def mark_thread_unsent_failed(
+        self,
+        pending_id: str,
+        error_summary: str,
+        recovery_prompt: str,
+    ) -> dict[str, object] | None:
+        with self._locked(pending_id):
+            record = self._read_record(self._pending_path(pending_id))
+            if record["state"] != "thread_starting":
+                return None
+            self._set_state(record, "failed")
+            record["request_outcome"] = "definitely_unsent"
+            record["error_summary"] = error_summary
+            record["recovery_prompt"] = recovery_prompt
+            record["failed_at"] = self.now()
+            self._persist(record)
+            return record
+
+    def mark_turn_unsent(
+        self,
+        pending_id: str,
+        error_summary: str,
+        recovery_prompt: str,
+    ) -> dict[str, object] | None:
+        with self._locked(pending_id):
+            record = self._read_record(self._pending_path(pending_id))
+            if record["state"] != "turn_starting":
+                return None
+            self._set_state(record, "thread_created")
+            record["request_outcome"] = "definitely_unsent"
+            record["error_summary"] = error_summary
+            record["recovery_prompt"] = recovery_prompt
+            record["turn_unsent_at"] = self.now()
             self._persist(record)
             return record
 

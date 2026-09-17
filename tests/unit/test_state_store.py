@@ -346,6 +346,62 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(claimed["state"], "thread_created")
         self.assertEqual(claimed["new_thread_id"], "thr-new")
 
+    def test_proven_unsent_thread_request_returns_to_retryable_failed(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+        record = store.prepare("/repo", "handoff", "/repo/AI-HANDOFF.md")
+        store.arm(record["pending_id"], "thr-old", timeout_seconds=300)
+        store.claim_confirm(record["pending_id"])
+        store.mark_thread_starting(
+            record["pending_id"],
+            recovery_prompt="Resume the full transfer.",
+        )
+
+        failed = store.mark_thread_unsent_failed(
+            record["pending_id"],
+            error_summary="thread/start was definitely not sent",
+            recovery_prompt="Resume the full transfer.",
+        )
+
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(failed["request_outcome"], "definitely_unsent")
+        self.assertEqual(
+            failed["error_summary"],
+            "thread/start was definitely not sent",
+        )
+        retried = store.claim_confirm(record["pending_id"])
+        self.assertEqual(retried["state"], "transferring")
+
+    def test_proven_unsent_turn_request_returns_to_thread_created(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+        record = store.prepare("/repo", "handoff", "/repo/AI-HANDOFF.md")
+        store.arm(record["pending_id"], "thr-old", timeout_seconds=300)
+        store.claim_confirm(record["pending_id"])
+        store.mark_thread_starting(
+            record["pending_id"],
+            recovery_prompt="Resume only the turn.",
+        )
+        store.mark_thread_created(record["pending_id"], "thr-new")
+        store.mark_turn_starting(
+            record["pending_id"],
+            client_user_message_id=f'project-handoff:{record["pending_id"]}',
+        )
+
+        resumable = store.mark_turn_unsent(
+            record["pending_id"],
+            error_summary="turn/start was definitely not sent",
+            recovery_prompt="Resume only the turn.",
+        )
+
+        self.assertEqual(resumable["state"], "thread_created")
+        self.assertEqual(resumable["new_thread_id"], "thr-new")
+        self.assertEqual(resumable["request_outcome"], "definitely_unsent")
+        self.assertEqual(
+            resumable["recovery_prompt"],
+            "Resume only the turn.",
+        )
+        claimed = store.claim_confirm(record["pending_id"])
+        self.assertEqual(claimed["state"], "thread_created")
+
     def test_invalid_pending_id_is_rejected(self):
         store = StateStore(self.root, now=lambda: 100.0)
 
