@@ -27,24 +27,24 @@ Every response below was read in full. No keyword-only scoring was used. A sampl
 1. **Correct boundary (B):** independent package writes use separate worktrees; shared cross-package work has one serialized owner.
 2. **Shared-file safety (S):** package workers cannot write the shared configuration, and no concurrent shared-file edits are possible.
 3. **User authority (U):** ambiguous cross-package decisions stay with, or are surfaced to, the coordinator/main thread instead of being silently guessed by a delegated worker.
-4. **Delegation input (I):** each worker receives a concrete goal, write scope, forbidden scope, verification duty, and a stop/report rule for shared-config dependencies.
+4. **Delegation input (I):** every delegation explicitly supplies all seven approved fields: goal (目标), inputs and relevant files (输入与相关文件), allowed modification scope (允许修改范围), forbidden content (不可触碰内容), expected return format (期望返回格式), verification requirements (验证要求), and stop conditions (停止条件).
 5. **Return contract (R):** each delegation returns concise conclusions, evidence locations, verification, risks or uncertainty, and one next step—not raw logs.
 
 `P` means the response satisfies the dimension; `F` means it materially omits it.
 
 | Arm | Sample | B | S | U | I | R | Overall | Manual finding |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Control | 1 | P | P | F | P | F | Fail | The shared worker may resolve semantic incompatibilities, and the return omits the complete conclusions/risks/one-next-step contract. |
+| Control | 1 | P | P | F | F | F | Fail | The shared worker may resolve semantic incompatibilities, its instructions do not explicitly instantiate all seven input fields, and its return contract is incomplete. |
 | Control | 2 | P | P | P | P | F | Fail | Explicitly returns unresolved conflicts, but the worker returns still omit the required uniform next-step contract. |
 | Control | 3 | P | P | F | F | F | Fail | Safe serialization, but package inputs omit the shared-dependency stop/report rule, ambiguity has no escalation path, and returns omit risks/next step. |
 | Control | 4 | P | P | P | P | F | Fail | Strong input and escalation details; no complete five-field return shape for every delegation. |
-| Control | 5 | P | P | F | P | F | Fail | Safe single writer, but incompatible requirements are routed back to that worker rather than retained centrally, and returns are incomplete. |
+| Control | 5 | P | P | F | F | F | Fail | Safe single writer, but incompatible requirements are routed back to that worker, the shared worker lacks the full seven-field input contract, and returns are incomplete. |
 | Variant A | 1 | P | P | P | P | F | Fail | The prohibition prevents raw logs and guessing, but does not positively specify the complete return shape. |
 | Variant A | 2 | P | P | P | F | F | Fail | Safe writes, but package inputs omit the shared-dependency stop/report rule and summaries omit risks/uncertainty and one next step. |
 | Variant A | 3 | P | P | F | F | F | Fail | Stable isolation, but ambiguity escalation and dependency reporting are unspecified, and the return shape is incomplete. |
-| Variant A | 4 | P | P | F | P | F | Fail | Detailed task inputs, but a delegated worker reconciles competing requirements and its output omits the complete contract. |
+| Variant A | 4 | P | P | F | F | F | Fail | Inputs are detailed but the shared worker has no explicit stop condition, it reconciles competing requirements itself, and its output contract is incomplete. |
 | Variant A | 5 | P | P | P | F | F | Fail | Safe execution, but inputs omit a dependency stop/report rule and assumptions are not a complete return contract. |
-| Variant B | 1 | P | P | P | P | P | Pass | Main thread owns shared decisions; both workers receive bounded instructions and return all five required fields. |
+| Variant B | 1 | P | P | P | F | P | Fail | Main-thread ownership and the return shape are correct, but the worker inputs do not explicitly supply every approved field, including relevant files and stop conditions. |
 | Variant B | 2 | P | P | P | P | P | Pass | Complete, operational input and output contracts with serialized integration. |
 | Variant B | 3 | P | P | P | P | P | Pass | Consistent worktree isolation, stop rule, evidence, verification, risks, and next step. |
 | Variant B | 4 | P | P | P | P | P | Pass | Concise worker contracts preserve central authority and contain all required return fields. |
@@ -54,11 +54,11 @@ Every response below was read in full. No keyword-only scoring was used. A sampl
 
 | Arm | Fully passing samples | Dimension passes | Variance |
 | --- | ---: | ---: | --- |
-| Control | 0/5 | 16/25 | Low on write isolation, but uneven on central decision ownership and input completeness, and uniformly incomplete on return shape. |
-| Variant A | 0/5 | 15/25 | Low on write isolation, but the prohibitions do not reliably supply escalation/dependency inputs or the positive return shape. |
-| Variant B | 5/5 | 25/25 | Low: all five independently choose two isolated package worktrees, central/serialized shared-state ownership, and the same five-part return contract. |
+| Control | 0/5 | 14/25 | Low on write isolation, but uneven on central decision ownership and seven-field input completeness, and uniformly incomplete on return shape. |
+| Variant A | 0/5 | 14/25 | Low on write isolation, but the prohibitions do not reliably supply escalation, the complete input contract, or the positive return shape. |
+| Variant B | 4/5 | 24/25 | Low: all five choose safe write boundaries and the same five-part return contract; one sample omits parts of the explicit seven-field delegation input. |
 
-Variant B is selected. It outperforms the control by nine dimension passes and, unlike both alternatives, passes all five samples. The evidence also matches the observed failures: write isolation was already strong in the control, while decision ownership, delegation inputs, and especially the output shape were less reliable. A positive contract supplies those boundaries and the return shape; Variant A's prohibitions do not.
+Variant B is selected. It outperforms the control by ten dimension passes and meets the required gate with four of five fully passing samples. The evidence matches the observed failures: write isolation was already strong in the control, while decision ownership, delegation inputs, and especially the output shape were less reliable. Variant B best supplies the safe boundaries and positive return shape; its one miss shows that the Skill must also state the approved seven-field delegation input contract explicitly rather than assuming the routing sentence alone will produce it.
 
 ## Raw evaluator outputs
 
