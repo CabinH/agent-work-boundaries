@@ -294,8 +294,76 @@ class HandoffServiceTests(unittest.TestCase):
 
         result = service.wait_and_expire(pending_id)
 
-        self.assertEqual(sleeps, [50.0])
+        self.assertEqual(sleeps, [0.05, 50.0])
         self.assertEqual(result["state"], "transferred")
+        self.assertEqual(target.read_text(), VALID_HANDOFF)
+        self.assertEqual(len(client.calls), 1)
+
+    def test_wait_backs_off_between_repeated_declined_expiry_claims(self):
+        timeline = iter(
+            (
+                100.0,
+                100.0,
+                400.0,
+                350.0,
+                400.0,
+                350.0,
+                400.0,
+                350.0,
+                400.0,
+                400.0,
+                400.0,
+            )
+        )
+        last_time = 100.0
+
+        def now():
+            nonlocal last_time
+            try:
+                last_time = next(timeline)
+            except StopIteration:
+                pass
+            return last_time
+
+        sleeps = []
+        service = HandoffService(
+            store=StateStore(self.root / "state", now=now),
+            app_server_client=RecordingClient(),
+            private_handoff_dir=self.root / "private",
+            sleeper=sleeps.append,
+        )
+        pending_id = service.prepare(
+            self.root,
+            VALID_HANDOFF,
+            self.root / "docs" / "AI-HANDOFF.md",
+        )
+        service.arm(pending_id, "thr-old", 300)
+
+        result = service.wait_and_expire(pending_id)
+
+        self.assertEqual(sleeps, [0.05, 0.05, 0.05])
+        self.assertEqual(result["state"], "transferred")
+
+    def test_wait_exits_without_backoff_when_another_actor_wins_claim(self):
+        service, client, clock = self.make_service()
+        pending_id, target = self.prepare_armed(service)
+        clock.value = 400.0
+        original_claim_expired = service.store.claim_expired
+
+        def confirm_then_decline_expiry(claimed_pending_id):
+            service.confirm(claimed_pending_id)
+            return original_claim_expired(claimed_pending_id)
+
+        with mock.patch.object(
+            service.store,
+            "claim_expired",
+            side_effect=confirm_then_decline_expiry,
+        ):
+            result = service.wait_and_expire(pending_id)
+
+        self.assertIsNone(result)
+        self.assertEqual(clock.sleeps, [])
+        self.assertEqual(service.status("thr-old")["state"], "transferred")
         self.assertEqual(target.read_text(), VALID_HANDOFF)
         self.assertEqual(len(client.calls), 1)
 
@@ -568,18 +636,17 @@ class HandoffServiceTests(unittest.TestCase):
 
             private_copy = self.root / "private" / f"{pending_id}.md"
             self.assertEqual(result["state"], "transferred")
-            self.assertFalse((displaced / target.name).exists())
+            self.assertEqual((displaced / target.name).read_bytes(), b"")
             self.assertEqual(private_copy.read_text(), VALID_HANDOFF)
             self.assertIn(str(private_copy), client.calls[0][1])
 
-    def test_rollback_failure_marks_failed_and_does_not_launch(self):
+    def test_exact_inode_sanitization_failure_marks_failed_and_does_not_launch(self):
         service, client, _clock = self.make_service()
         target = self.root / "docs" / "AI-HANDOFF.md"
         pending_id = service.prepare(self.root, VALID_HANDOFF, target)
         service.arm(pending_id, "thr-old", 300)
         target.parent.mkdir()
         real_replace = os.replace
-        real_unlink = os.unlink
 
         with tempfile.TemporaryDirectory() as outside_name:
             displaced = Path(outside_name) / "displaced-docs"
@@ -595,17 +662,12 @@ class HandoffServiceTests(unittest.TestCase):
                     target.parent.rename(displaced)
                 return real_replace(source, destination, *args, **kwargs)
 
-            def deny_destination_rollback(name, *args, **kwargs):
-                if name == target.name and "dir_fd" in kwargs:
-                    raise PermissionError("rollback denied")
-                return real_unlink(name, *args, **kwargs)
-
             with mock.patch(
                 "handoff_service.os.replace",
                 side_effect=move_parent_outside,
             ), mock.patch(
-                "handoff_service.os.unlink",
-                side_effect=deny_destination_rollback,
+                "handoff_service.os.ftruncate",
+                side_effect=OSError("sanitize denied"),
             ):
                 with self.assertRaisesRegex(OSError, "roll back unsafe"):
                     service.confirm(pending_id)
@@ -615,6 +677,88 @@ class HandoffServiceTests(unittest.TestCase):
             self.assertEqual(private_copy.read_text(), VALID_HANDOFF)
             self.assertTrue((displaced / target.name).exists())
             self.assertEqual(client.calls, [])
+
+    def test_displaced_rollback_never_deletes_swapped_unrelated_file(self):
+        service, client, _clock = self.make_service()
+        target = self.root / "docs" / "AI-HANDOFF.md"
+        pending_id = service.prepare(self.root, VALID_HANDOFF, target)
+        service.arm(pending_id, "thr-old", 300)
+        target.parent.mkdir()
+        real_replace = os.replace
+        real_stat = os.stat
+        real_ftruncate = os.ftruncate
+
+        with tempfile.TemporaryDirectory() as outside_name:
+            displaced = Path(outside_name) / "displaced-docs"
+            moved = False
+            swapped = False
+            unrelated_content = b"unrelated-user-content"
+
+            def move_parent_outside(source, destination, *args, **kwargs):
+                nonlocal moved
+                is_project_publish = (
+                    destination == target.name and "dst_dir_fd" in kwargs
+                )
+                if not moved and is_project_publish:
+                    moved = True
+                    target.parent.rename(displaced)
+                    (displaced / "unrelated.txt").write_bytes(unrelated_content)
+                return real_replace(source, destination, *args, **kwargs)
+
+            def swap_destination():
+                nonlocal swapped
+                if swapped:
+                    return
+                swapped = True
+                real_replace(
+                    displaced / target.name,
+                    displaced / "published-stash.md",
+                )
+                real_replace(
+                    displaced / "unrelated.txt",
+                    displaced / target.name,
+                )
+
+            def race_stat(name, *args, **kwargs):
+                metadata = real_stat(name, *args, **kwargs)
+                if (
+                    moved
+                    and not swapped
+                    and name == target.name
+                    and "dir_fd" in kwargs
+                ):
+                    swap_destination()
+                return metadata
+
+            def race_ftruncate(descriptor, length):
+                if moved and not swapped:
+                    swap_destination()
+                return real_ftruncate(descriptor, length)
+
+            with mock.patch(
+                "handoff_service.os.replace",
+                side_effect=move_parent_outside,
+            ), mock.patch(
+                "handoff_service.os.stat",
+                side_effect=race_stat,
+            ), mock.patch(
+                "handoff_service.os.ftruncate",
+                side_effect=race_ftruncate,
+            ):
+                result = service.confirm(pending_id)
+
+            private_copy = self.root / "private" / f"{pending_id}.md"
+            self.assertEqual(result["state"], "transferred")
+            self.assertEqual(
+                (displaced / target.name).read_bytes(),
+                unrelated_content,
+            )
+            self.assertEqual(
+                (displaced / "published-stash.md").read_bytes(),
+                b"",
+            )
+            self.assertEqual(private_copy.read_text(), VALID_HANDOFF)
+            self.assertIn(str(private_copy), client.calls[0][1])
 
     def test_post_replace_fsync_failure_rolls_back_displaced_destination(self):
         service, client, _clock = self.make_service()
@@ -664,7 +808,7 @@ class HandoffServiceTests(unittest.TestCase):
 
             private_copy = self.root / "private" / f"{pending_id}.md"
             self.assertEqual(result["state"], "transferred")
-            self.assertFalse((displaced / target.name).exists())
+            self.assertEqual((displaced / target.name).read_bytes(), b"")
             self.assertEqual(private_copy.read_text(), VALID_HANDOFF)
             self.assertIn(str(private_copy), client.calls[0][1])
 
