@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import copy
 import json
 import os
@@ -9,6 +10,7 @@ import re
 import shlex
 import shutil
 import stat
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -878,3 +880,66 @@ def uninstall_bundle(codex_home: Path, dry_run: bool) -> InstallReport:
         backup_root=backup_root,
         dry_run=False,
     )
+
+
+def _report_document(report: InstallReport) -> dict[str, Any]:
+    return {
+        "action": report.action,
+        "changed_paths": [str(path) for path in report.changed_paths],
+        "backed_up_files": [str(path) for path in report.backed_up_files],
+        "backup_root": (
+            str(report.backup_root) if report.backup_root is not None else None
+        ),
+        "dry_run": report.dry_run,
+    }
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Install or uninstall the Agent Work Boundaries bundle."
+    )
+    parser.add_argument(
+        "--codex-home",
+        type=Path,
+        default=Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser(),
+        help="Codex configuration directory (default: CODEX_HOME or ~/.codex)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate and report changes without modifying files",
+    )
+    parser.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="remove the two managed Skills and their Hook handlers",
+    )
+    arguments = parser.parse_args(argv)
+    codex_home = arguments.codex_home.expanduser()
+    action = "uninstall" if arguments.uninstall else "install"
+    try:
+        if arguments.uninstall:
+            report = uninstall_bundle(codex_home, arguments.dry_run)
+        else:
+            source_root = Path(__file__).resolve().parents[1]
+            report = install_bundle(source_root, codex_home, arguments.dry_run)
+    except InstallError as error:
+        json.dump(
+            {
+                "action": action,
+                "dry_run": arguments.dry_run,
+                "error": str(error),
+            },
+            sys.stderr,
+            ensure_ascii=False,
+        )
+        sys.stderr.write("\n")
+        return 1
+
+    json.dump(_report_document(report), sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

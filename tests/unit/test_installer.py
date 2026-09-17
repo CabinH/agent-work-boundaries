@@ -1,10 +1,12 @@
 import copy
+import io
 import json
 import os
 import shutil
 import stat
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -42,11 +44,155 @@ def _managed_handler_count(document: dict, event: str) -> int:
     )
 
 
+def _invoke_main(argv: list[str]) -> tuple[int, str, str]:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        exit_code = installer_module.main(argv)
+    return exit_code, stdout.getvalue(), stderr.getvalue()
+
+
 class InstallerTests(unittest.TestCase):
     def setUp(self):
         self.hook_script = Path(
             "/tmp/codex/skills/project-handoff/scripts/handoff_hook.py"
         )
+
+    def test_cli_install_dry_run_reports_json_without_creating_home(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / "missing-codex-home"
+
+            exit_code, stdout, stderr = _invoke_main(
+                ["--codex-home", str(codex_home), "--dry-run"]
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(stderr, "")
+            self.assertEqual(
+                json.loads(stdout),
+                {
+                    "action": "install",
+                    "backed_up_files": [],
+                    "backup_root": None,
+                    "changed_paths": [
+                        str(codex_home / "skills" / "project-handoff"),
+                        str(codex_home / "skills" / "task-router"),
+                        str(codex_home / "hooks.json"),
+                    ],
+                    "dry_run": True,
+                },
+            )
+            self.assertFalse(codex_home.exists())
+
+    def test_cli_install_reports_json_and_installs_into_explicit_home(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / "codex-home"
+
+            exit_code, stdout, stderr = _invoke_main(
+                ["--codex-home", str(codex_home)]
+            )
+
+            report = json.loads(stdout)
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(stderr, "")
+            self.assertEqual(report["action"], "install")
+            self.assertEqual(report["backup_root"], None)
+            self.assertEqual(report["dry_run"], False)
+            self.assertEqual(
+                report["changed_paths"],
+                [
+                    str(codex_home / "skills" / "project-handoff"),
+                    str(codex_home / "skills" / "task-router"),
+                    str(codex_home / "hooks.json"),
+                ],
+            )
+            self.assertTrue(
+                (codex_home / "skills" / "project-handoff" / "SKILL.md").is_file()
+            )
+            self.assertTrue(
+                (codex_home / "skills" / "task-router" / "SKILL.md").is_file()
+            )
+
+    def test_cli_uninstall_reports_json_and_removes_managed_skills(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / "codex-home"
+            install_bundle(
+                Path(__file__).resolve().parents[2], codex_home, dry_run=False
+            )
+
+            exit_code, stdout, stderr = _invoke_main(
+                ["--codex-home", str(codex_home), "--uninstall"]
+            )
+
+            report = json.loads(stdout)
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(stderr, "")
+            self.assertEqual(report["action"], "uninstall")
+            self.assertEqual(report["dry_run"], False)
+            self.assertIsInstance(report["backup_root"], str)
+            self.assertIn(
+                str(codex_home / "skills" / "project-handoff"),
+                report["changed_paths"],
+            )
+            self.assertFalse(
+                (codex_home / "skills" / "project-handoff").exists()
+            )
+            self.assertFalse((codex_home / "skills" / "task-router").exists())
+
+    def test_cli_malformed_hooks_returns_nonzero_without_mutation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / "codex-home"
+            codex_home.mkdir()
+            hooks_path = codex_home / "hooks.json"
+            hooks_path.write_text('{"hooks":', encoding="utf-8")
+            before = _tree_snapshot(codex_home)
+
+            exit_code, stdout, stderr = _invoke_main(
+                ["--codex-home", str(codex_home)]
+            )
+
+            self.assertNotEqual(exit_code, 0)
+            self.assertEqual(stdout, "")
+            error = json.loads(stderr)
+            self.assertEqual(error["action"], "install")
+            self.assertIn("cannot read hooks file", error["error"])
+            self.assertEqual(_tree_snapshot(codex_home), before)
+
+    def test_cli_defaults_to_codex_home_environment_variable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / "environment-codex-home"
+            with patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(codex_home)},
+                clear=False,
+            ):
+                exit_code, stdout, stderr = _invoke_main(["--dry-run"])
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn(
+                str(codex_home / "hooks.json"),
+                json.loads(stdout)["changed_paths"],
+            )
+            self.assertFalse(codex_home.exists())
+
+    def test_cli_defaults_to_expanded_user_codex_home(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            expected_home = Path(temp_dir) / ".codex"
+            with patch.dict(
+                os.environ,
+                {"HOME": temp_dir},
+                clear=True,
+            ):
+                exit_code, stdout, stderr = _invoke_main(["--dry-run"])
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn(
+                str(expected_home / "hooks.json"),
+                json.loads(stdout)["changed_paths"],
+            )
+            self.assertFalse(expected_home.exists())
 
     def test_install_backs_up_existing_skill_and_preserves_hooks(self):
         with tempfile.TemporaryDirectory() as temp_dir:
