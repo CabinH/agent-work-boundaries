@@ -67,6 +67,8 @@ class StateStore:
         session_id: str,
         timeout_seconds: int,
     ) -> dict[str, object] | None:
+        if timeout_seconds != 300:
+            raise ValueError("timeout_seconds must be exactly 300")
         with self._locked(pending_id):
             record = self._read_record(self._pending_path(pending_id))
             if record["state"] != "draft":
@@ -188,9 +190,33 @@ class StateStore:
 
     def get_session_status(self, session_id: str) -> dict[str, object] | None:
         path = self._session_path(session_id)
-        if not path.exists():
-            return None
-        return self._read_record(path)
+        cached = self._read_record(path) if path.exists() else None
+        candidates: list[dict[str, object]] = []
+        for pending_path in self.pending_dir.glob("*.json"):
+            pending_id = pending_path.stem
+            try:
+                with self._locked(pending_id):
+                    if pending_path.exists():
+                        record = self._read_record(pending_path)
+                        if record.get("session_id") == session_id:
+                            candidates.append(record)
+            except ValueError:
+                continue
+        if not candidates:
+            return cached
+
+        record = max(candidates, key=self._session_record_rank)
+        pending_id = str(record["pending_id"])
+        with self._locked(pending_id):
+            record = self._read_record(self._pending_path(pending_id))
+            with self._session_locked(session_id):
+                if path.exists():
+                    current_cache = self._read_record(path)
+                    for key in ("compaction_count", "compaction_sources"):
+                        if key in current_cache:
+                            record[key] = current_cache[key]
+                self._write_record(path, record)
+        return record
 
     def _pending_path(self, pending_id: str) -> Path:
         self._validate_pending_id(pending_id)
@@ -229,6 +255,15 @@ class StateStore:
         if new_state not in LEGAL_TRANSITIONS[state]:
             raise ValueError(f"illegal state transition: {state} -> {new_state}")
         record["state"] = new_state
+
+    @staticmethod
+    def _session_record_rank(record: dict[str, object]) -> tuple[bool, float, str]:
+        active = record.get("state") not in {"transferred", "cancelled"}
+        return (
+            active,
+            float(record.get("created_at", 0.0)),
+            str(record["pending_id"]),
+        )
 
     @staticmethod
     def _validate_pending_id(pending_id: str) -> None:

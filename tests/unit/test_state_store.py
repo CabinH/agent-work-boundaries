@@ -87,6 +87,31 @@ class StateStoreTests(unittest.TestCase):
                 0o700,
             )
 
+    def test_arm_rejects_every_timeout_except_five_minutes(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+
+        for timeout_seconds in (0, -1, 1, 299, 301):
+            with self.subTest(timeout_seconds=timeout_seconds):
+                record = store.prepare(
+                    "/repo",
+                    "handoff",
+                    "/repo/AI-HANDOFF.md",
+                )
+                session_id = f"thr-{timeout_seconds}"
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "timeout_seconds must be exactly 300",
+                ):
+                    store.arm(
+                        record["pending_id"],
+                        session_id,
+                        timeout_seconds=timeout_seconds,
+                    )
+
+                self.assertEqual(self.read_pending(record["pending_id"]), record)
+                self.assertIsNone(store.get_session_status(session_id))
+
     def test_any_response_wins_against_expiry(self):
         clock = [100.0]
         store = StateStore(self.root, now=lambda: clock[0])
@@ -104,6 +129,38 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(responded["state"], "responded")
         self.assertEqual(self.read_pending(record["pending_id"]), responded)
         self.assertEqual(self.read_session("thr-old"), responded)
+
+    def test_session_lookup_recovers_after_interrupted_cache_write(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+        record = store.prepare("/repo", "handoff", "/repo/AI-HANDOFF.md")
+        armed = store.arm(record["pending_id"], "thr-old", timeout_seconds=300)
+        session_name = hashlib.sha256(b"thr-old").hexdigest()
+        (self.root / "sessions" / f"{session_name}.json").unlink()
+
+        recovered = store.get_session_status("thr-old")
+        responded = store.respond("thr-old")
+
+        self.assertEqual(recovered, armed)
+        self.assertIsNotNone(responded)
+        self.assertEqual(responded["state"], "responded")
+        self.assertEqual(responded["pending_id"], armed["pending_id"])
+        self.assertEqual(self.read_pending(record["pending_id"]), responded)
+        self.assertEqual(self.read_session("thr-old"), responded)
+
+    def test_session_lookup_recovers_stale_cache_after_interrupted_update(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+        record = store.prepare("/repo", "handoff", "/repo/AI-HANDOFF.md")
+        armed = store.arm(record["pending_id"], "thr-old", timeout_seconds=300)
+        claimed = store.claim_confirm(record["pending_id"])
+        session_name = hashlib.sha256(b"thr-old").hexdigest()
+        session_path = self.root / "sessions" / f"{session_name}.json"
+        session_path.write_text(json.dumps(armed))
+
+        recovered = store.get_session_status("thr-old")
+
+        self.assertEqual(recovered, claimed)
+        self.assertEqual(self.read_pending(record["pending_id"]), claimed)
+        self.assertEqual(self.read_session("thr-old"), claimed)
 
     def test_expiry_wins_against_late_response(self):
         clock = [100.0]
