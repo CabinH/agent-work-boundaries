@@ -536,6 +536,69 @@ class InstallerTests(unittest.TestCase):
                 stat.S_IMODE((codex_home / "hooks.json").stat().st_mode), 0o600
             )
 
+    def test_install_excludes_python_runtime_artifacts_from_both_skills(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            source_root = temp_root / "source"
+            shutil.copytree(
+                Path(__file__).resolve().parents[2] / "skills",
+                source_root / "skills",
+            )
+            project = source_root / "skills" / "project-handoff"
+            router = source_root / "skills" / "task-router"
+            seeded_artifacts = (
+                project / "__pycache__" / "root.cpython-312.pyc",
+                project
+                / "scripts"
+                / "__pycache__"
+                / "nested.cpython-312.pyo",
+                project / "scripts" / "direct.pyc",
+                router / "__pycache__" / "router.cpython-312.pyc",
+                router / "references" / "nested" / "analysis.pyo",
+                router
+                / "references"
+                / "nested"
+                / "__pycache__"
+                / "analysis.cpython-312.pyc",
+            )
+            for artifact in seeded_artifacts:
+                artifact.parent.mkdir(parents=True, exist_ok=True)
+                artifact.write_bytes(b"runtime artifact\n")
+            legitimate_files = {
+                project / "scripts" / "legitimate.py": b"print('keep')\n",
+                project / "assets" / "model.pyc.txt": b"asset\n",
+                router / "references" / "legitimate.py": b"keep = True\n",
+                router / "assets" / "profile.pyo.json": b"{}\n",
+            }
+            for legitimate, content in legitimate_files.items():
+                legitimate.parent.mkdir(parents=True, exist_ok=True)
+                legitimate.write_bytes(content)
+            codex_home = temp_root / "codex-home"
+
+            install_bundle(source_root, codex_home, dry_run=False)
+
+            for skill_name in ("project-handoff", "task-router"):
+                installed = codex_home / "skills" / skill_name
+                with self.subTest(skill_name=skill_name):
+                    self.assertFalse(
+                        any(path.name == "__pycache__" for path in installed.rglob("*"))
+                    )
+                    self.assertFalse(
+                        any(
+                            path.is_file() and path.suffix in {".pyc", ".pyo"}
+                            for path in installed.rglob("*")
+                        )
+                    )
+            for source_file, content in legitimate_files.items():
+                installed_file = (
+                    codex_home
+                    / "skills"
+                    / source_file.relative_to(source_root / "skills")
+                )
+                self.assertEqual(installed_file.read_bytes(), content)
+            for artifact in seeded_artifacts:
+                self.assertTrue(artifact.is_file())
+
     def test_install_rejects_symlinked_managed_parent_without_touching_target(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)

@@ -561,13 +561,32 @@ def _remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def _ignore_python_runtime_artifacts(
+    directory: str, names: list[str]
+) -> list[str]:
+    ignored: list[str] = []
+    for name in names:
+        mode = _lstat_mode(Path(directory) / name)
+        if name == "__pycache__" and mode is not None and stat.S_ISDIR(mode):
+            ignored.append(name)
+        elif (
+            name.endswith((".pyc", ".pyo"))
+            and mode is not None
+            and stat.S_ISREG(mode)
+        ):
+            ignored.append(name)
+    return sorted(ignored)
+
+
 def _stage_skill(source: Path, target: Path) -> Path:
     stage = Path(
         tempfile.mkdtemp(prefix=f".{target.name}.stage-", dir=str(target.parent))
     )
     stage.rmdir()
     try:
-        shutil.copytree(source, stage)
+        shutil.copytree(
+            source, stage, ignore=_ignore_python_runtime_artifacts
+        )
         _apply_private_modes(stage)
     except Exception:
         if _path_exists(stage):
