@@ -1477,6 +1477,76 @@ class InstallerTests(unittest.TestCase):
 
             self.assertEqual(_tree_snapshot(codex_home), before)
 
+    def test_displaced_lock_inode_never_allows_nested_critical_sections(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / "codex-home"
+            codex_home.mkdir()
+            lock_path = codex_home / ".agent-work-boundaries.lock"
+            lock_path.touch(mode=0o600)
+            displaced = codex_home / ".displaced-bundle-lock"
+            nested_inside = threading.Event()
+            release_nested = threading.Event()
+            nested_errors: list[BaseException] = []
+            nested_thread: threading.Thread | None = None
+            main_thread = threading.current_thread()
+            real_flock = fcntl.flock
+            swapped = False
+
+            def run_nested_operation():
+                try:
+                    with installer_module._bundle_lock(codex_home):
+                        nested_inside.set()
+                        if not release_nested.wait(timeout=5):
+                            raise AssertionError("nested lock was not released")
+                except BaseException as error:
+                    nested_errors.append(error)
+
+            def swap_after_main_lock(descriptor, operation):
+                nonlocal swapped, nested_thread
+                result = real_flock(descriptor, operation)
+                if (
+                    threading.current_thread() is main_thread
+                    and operation & fcntl.LOCK_EX
+                    and not swapped
+                ):
+                    swapped = True
+                    os.replace(lock_path, displaced)
+                    lock_path.write_bytes(b"")
+                    lock_path.chmod(0o600)
+                    nested_thread = threading.Thread(
+                        target=run_nested_operation
+                    )
+                    nested_thread.start()
+                    if not nested_inside.wait(timeout=5):
+                        raise AssertionError("nested operation did not acquire lock")
+                return result
+
+            outer_entered = False
+            outer_error: BaseException | None = None
+            try:
+                with patch.object(
+                    installer_module.fcntl,
+                    "flock",
+                    side_effect=swap_after_main_lock,
+                ):
+                    try:
+                        with installer_module._bundle_lock(codex_home):
+                            outer_entered = True
+                    except BaseException as error:
+                        outer_error = error
+            finally:
+                release_nested.set()
+                if nested_thread is not None:
+                    nested_thread.join(timeout=10)
+
+            self.assertTrue(swapped)
+            self.assertTrue(nested_inside.is_set())
+            self.assertFalse(outer_entered)
+            self.assertIsInstance(outer_error, InstallError)
+            self.assertEqual(nested_errors, [])
+            self.assertIsNotNone(nested_thread)
+            self.assertFalse(nested_thread.is_alive())
+
     def test_uninstall_contends_during_first_install_before_journal_exists(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             codex_home = Path(temp_dir) / "codex-home"
@@ -2015,21 +2085,24 @@ class InstallerTests(unittest.TestCase):
                 ),
             ),
         ):
-            with self.subTest(control_name=control_name):
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    codex_home = Path(temp_dir) / "codex-home"
-                    codex_home.mkdir()
-                    control = codex_home / control_name
-                    control.write_text("{}\n", encoding="utf-8")
-                    control.chmod(0o644)
-                    before = _tree_snapshot(codex_home)
+            for unsafe_mode in (0o400, 0o640, 0o644):
+                with self.subTest(
+                    control_name=control_name, unsafe_mode=oct(unsafe_mode)
+                ):
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        codex_home = Path(temp_dir) / "codex-home"
+                        codex_home.mkdir()
+                        control = codex_home / control_name
+                        control.write_text("{}\n", encoding="utf-8")
+                        control.chmod(unsafe_mode)
+                        before = _tree_snapshot(codex_home)
 
-                    with self.assertRaisesRegex(
-                        InstallError, "permissions must be private"
-                    ):
-                        operation(codex_home)
+                        with self.assertRaisesRegex(
+                            InstallError, "permissions must be private"
+                        ):
+                            operation(codex_home)
 
-                    self.assertEqual(_tree_snapshot(codex_home), before)
+                        self.assertEqual(_tree_snapshot(codex_home), before)
 
     def test_hard_linked_control_files_are_rejected_before_use(self):
         repo_root = Path(__file__).resolve().parents[2]
@@ -2097,6 +2170,237 @@ class InstallerTests(unittest.TestCase):
                     metadata = control.stat()
                     self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
                     self.assertEqual(metadata.st_nlink, 1)
+
+    def test_journal_open_races_reject_unsafe_replacements_without_target_mutation(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        for replacement_kind in ("mode", "hardlink", "symlink"):
+            with self.subTest(replacement_kind=replacement_kind):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    codex_home = temp_root / "codex-home"
+                    install_bundle(repo_root, codex_home, dry_run=False)
+                    marker = (
+                        codex_home
+                        / "skills"
+                        / "project-handoff"
+                        / "original.txt"
+                    )
+                    marker.write_text("must stay partial\n", encoding="utf-8")
+                    real_replace_and_fsync = installer_module._replace_and_fsync
+                    crashed = False
+
+                    def crash_after_retire(source, target):
+                        nonlocal crashed
+                        result = real_replace_and_fsync(source, target)
+                        target_path = Path(target)
+                        if (
+                            not crashed
+                            and target_path.parent == codex_home / "skills"
+                            and ".retired-" in target_path.name
+                        ):
+                            crashed = True
+                            raise SystemExit("leave recoverable journal")
+                        return result
+
+                    with patch.object(
+                        installer_module,
+                        "_replace_and_fsync",
+                        side_effect=crash_after_retire,
+                    ):
+                        with self.assertRaisesRegex(
+                            SystemExit, "recoverable journal"
+                        ):
+                            install_bundle(repo_root, codex_home, dry_run=False)
+
+                    journal = (
+                        codex_home
+                        / ".agent-work-boundaries.transaction.json"
+                    )
+                    journal_payload = journal.read_bytes()
+                    managed_before = {
+                        name: _tree_snapshot(codex_home / "skills" / name)
+                        for name in ("project-handoff", "task-router")
+                    }
+                    hooks_before = (codex_home / "hooks.json").read_bytes()
+                    replacement = temp_root / "raced-journal"
+                    alias = temp_root / "raced-journal-alias"
+                    outside = temp_root / "raced-journal-outside"
+                    if replacement_kind == "symlink":
+                        outside.write_bytes(journal_payload)
+                        outside.chmod(0o600)
+                        replacement.symlink_to(outside)
+                    else:
+                        replacement.write_bytes(journal_payload)
+                        replacement.chmod(
+                            0o644 if replacement_kind == "mode" else 0o600
+                        )
+                        if replacement_kind == "hardlink":
+                            os.link(replacement, alias)
+                    real_open = os.open
+                    raced = False
+
+                    def replace_immediately_before_open(path, flags, *args, **kwargs):
+                        nonlocal raced
+                        if Path(path) == journal and not raced:
+                            raced = True
+                            os.replace(replacement, journal)
+                        return real_open(path, flags, *args, **kwargs)
+
+                    with patch.object(
+                        installer_module.os,
+                        "open",
+                        side_effect=replace_immediately_before_open,
+                    ):
+                        with self.assertRaises(InstallError):
+                            install_bundle(repo_root, codex_home, dry_run=False)
+
+                    self.assertTrue(raced)
+                    self.assertTrue(
+                        all(
+                            _tree_snapshot(codex_home / "skills" / name)
+                            == managed_before[name]
+                            for name in ("project-handoff", "task-router")
+                        )
+                    )
+                    self.assertEqual(
+                        (codex_home / "hooks.json").read_bytes(), hooks_before
+                    )
+
+    def test_journal_publish_races_reject_unsafe_replacements_without_target_mutation(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        for replacement_kind in ("mode", "hardlink", "symlink"):
+            with self.subTest(replacement_kind=replacement_kind):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    codex_home = temp_root / "codex-home"
+                    install_bundle(repo_root, codex_home, dry_run=False)
+                    marker = (
+                        codex_home
+                        / "skills"
+                        / "project-handoff"
+                        / "original.txt"
+                    )
+                    marker.write_text("must not be replaced\n", encoding="utf-8")
+                    managed_before = {
+                        name: _tree_snapshot(codex_home / "skills" / name)
+                        for name in ("project-handoff", "task-router")
+                    }
+                    hooks_before = (codex_home / "hooks.json").read_bytes()
+                    journal = (
+                        codex_home
+                        / ".agent-work-boundaries.transaction.json"
+                    )
+                    alias = temp_root / "published-journal-alias"
+                    outside = temp_root / "published-journal-outside"
+                    real_replace = os.replace
+                    raced = False
+
+                    def replace_after_publish(source, target):
+                        nonlocal raced
+                        result = real_replace(source, target)
+                        source_path = Path(source)
+                        target_path = Path(target)
+                        if (
+                            not raced
+                            and target_path == journal
+                            and source_path.name.startswith(
+                                ".agent-work-boundaries.transaction.json.tmp-"
+                            )
+                        ):
+                            raced = True
+                            payload = journal.read_bytes()
+                            substitute = temp_root / "published-journal-substitute"
+                            if replacement_kind == "symlink":
+                                outside.write_bytes(payload)
+                                outside.chmod(0o600)
+                                substitute.symlink_to(outside)
+                            else:
+                                substitute.write_bytes(payload)
+                                substitute.chmod(
+                                    0o644
+                                    if replacement_kind == "mode"
+                                    else 0o600
+                                )
+                                if replacement_kind == "hardlink":
+                                    os.link(substitute, alias)
+                            real_replace(substitute, journal)
+                        return result
+
+                    with patch.object(
+                        installer_module.os,
+                        "replace",
+                        side_effect=replace_after_publish,
+                    ):
+                        with self.assertRaises(InstallError):
+                            install_bundle(repo_root, codex_home, dry_run=False)
+
+                    self.assertTrue(raced)
+                    self.assertTrue(
+                        all(
+                            _tree_snapshot(codex_home / "skills" / name)
+                            == managed_before[name]
+                            for name in ("project-handoff", "task-router")
+                        )
+                    )
+                    self.assertEqual(
+                        (codex_home / "hooks.json").read_bytes(), hooks_before
+                    )
+
+    def test_journal_cleanup_refuses_a_substituted_canonical_inode(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            codex_home = temp_root / "codex-home"
+            repo_root = Path(__file__).resolve().parents[2]
+            real_replace_and_fsync = installer_module._replace_and_fsync
+
+            def crash_after_first_target(source, target):
+                result = real_replace_and_fsync(source, target)
+                target_path = Path(target)
+                journal = codex_home / ".agent-work-boundaries.transaction.json"
+                if (
+                    journal.exists()
+                    and target_path.parent == codex_home / "skills"
+                    and target_path.name == "project-handoff"
+                ):
+                    raise SystemExit("leave journal for cleanup race")
+                return result
+
+            with patch.object(
+                installer_module,
+                "_replace_and_fsync",
+                side_effect=crash_after_first_target,
+            ):
+                with self.assertRaisesRegex(SystemExit, "cleanup race"):
+                    install_bundle(repo_root, codex_home, dry_run=False)
+
+            journal = codex_home / ".agent-work-boundaries.transaction.json"
+            substitute = temp_root / "cleanup-substitute"
+            substitute.write_text('{"substitute": true}\n', encoding="utf-8")
+            substitute.chmod(0o600)
+            real_read = installer_module._read_journal_with_identity
+            swapped = False
+
+            def read_then_substitute(home):
+                nonlocal swapped
+                result = real_read(home)
+                if not swapped:
+                    swapped = True
+                    os.replace(substitute, journal)
+                return result
+
+            with patch.object(
+                installer_module,
+                "_read_journal_with_identity",
+                side_effect=read_then_substitute,
+            ):
+                with self.assertRaisesRegex(InstallError, "changed"):
+                    installer_module._clear_journal(codex_home)
+
+            self.assertTrue(swapped)
+            self.assertEqual(
+                journal.read_text(encoding="utf-8"),
+                '{"substitute": true}\n',
+            )
 
     def test_directory_fsync_failure_rolls_back_and_clears_journal(self):
         with tempfile.TemporaryDirectory() as temp_dir:

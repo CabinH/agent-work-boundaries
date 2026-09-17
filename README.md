@@ -51,7 +51,9 @@ install or uninstall command: while holding the lock, it first restores the
 pre-operation Skills and Hooks, removes only its validated staging paths, and
 then starts the requested operation. A corrupt, linked, non-private, or
 otherwise invalid lock or journal is rejected for manual inspection instead of
-being followed or deleted.
+being followed or deleted. Both control files must remain owner-only `0600`,
+single-link regular files; each open file descriptor is matched back to the
+canonical path before it can authorize recovery, mutation, or cleanup.
 
 ## Status
 

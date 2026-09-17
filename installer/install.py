@@ -74,6 +74,12 @@ class InstallReport:
     dry_run: bool
 
 
+@dataclass(frozen=True)
+class _ControlIdentity:
+    device: int
+    inode: int
+
+
 def _env_command_index(parts: list[str]) -> int | None:
     index = 1
     while index < len(parts):
@@ -476,21 +482,68 @@ def _validate_managed_target(name: str, target: Path) -> None:
     _validate_regular_tree(target, f"managed skill target {name}")
 
 
-def _validate_private_control_entry(path: Path, label: str) -> None:
-    mode = _lstat_mode(path)
-    if mode is None:
-        return
-    if stat.S_ISLNK(mode):
+def _control_identity(
+    metadata: os.stat_result, path: Path, label: str
+) -> _ControlIdentity:
+    if stat.S_ISLNK(metadata.st_mode):
         raise InstallError(f"{label} is a symbolic link: {path}")
-    if not stat.S_ISREG(mode):
+    if not stat.S_ISREG(metadata.st_mode):
         raise InstallError(f"{label} must be a regular file: {path}")
-    metadata = path.lstat()
     if metadata.st_nlink != 1:
         raise InstallError(f"{label} must not have hard links: {path}")
     if metadata.st_uid != os.getuid():
         raise InstallError(f"{label} must be owned by the current user: {path}")
-    if stat.S_IMODE(metadata.st_mode) & 0o077:
-        raise InstallError(f"{label} permissions must be private: {path}")
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise InstallError(
+            f"{label} permissions must be private (0600): {path}"
+        )
+    return _ControlIdentity(metadata.st_dev, metadata.st_ino)
+
+
+def _lstat_control_identity(
+    path: Path, label: str, *, missing_ok: bool = False
+) -> _ControlIdentity | None:
+    try:
+        metadata = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        if missing_ok:
+            return None
+        raise InstallError(f"{label} changed or disappeared: {path}") from None
+    except OSError as error:
+        raise InstallError(f"cannot inspect {label} {path}: {error}") from error
+    return _control_identity(metadata, path, label)
+
+
+def _fstat_control_identity(
+    descriptor: int, path: Path, label: str
+) -> _ControlIdentity:
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        raise InstallError(f"cannot inspect open {label} {path}: {error}") from error
+    return _control_identity(metadata, path, label)
+
+
+def _require_control_identity(
+    path: Path, label: str, expected: _ControlIdentity
+) -> None:
+    current = _lstat_control_identity(path, label)
+    if current != expected:
+        raise InstallError(f"{label} changed while in use: {path}")
+
+
+def _unlink_control_and_fsync(
+    path: Path, label: str, expected: _ControlIdentity
+) -> None:
+    """Unlink only the control inode previously validated by descriptor."""
+
+    _require_control_identity(path, label, expected)
+    path.unlink()
+    _fsync_directory(path.parent)
+
+
+def _validate_private_control_entry(path: Path, label: str) -> None:
+    _lstat_control_identity(path, label, missing_ok=True)
 
 
 def _validate_managed_paths(codex_home: Path, targets: dict[str, Path]) -> None:
@@ -903,48 +956,72 @@ def _bundle_lock(codex_home: Path):
     _assert_no_symlink_components(codex_home, "CODEX_HOME path")
     flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    created = False
-    try:
-        descriptor = os.open(lock_path, flags | os.O_CREAT | os.O_EXCL, 0o600)
-        created = True
-    except FileExistsError:
-        _validate_private_control_entry(lock_path, "bundle lock file")
+    for attempt in range(3):
+        created = False
         try:
-            descriptor = os.open(lock_path, flags)
-        except OSError as error:
-            raise InstallError(f"cannot open bundle lock file {lock_path}: {error}") from error
-    except OSError as error:
-        raise InstallError(f"cannot create bundle lock file {lock_path}: {error}") from error
-
-    try:
-        metadata = os.fstat(descriptor)
-        current = lock_path.lstat()
-        if not stat.S_ISREG(metadata.st_mode):
-            raise InstallError(f"bundle lock file must be regular: {lock_path}")
-        if (metadata.st_dev, metadata.st_ino) != (current.st_dev, current.st_ino):
-            raise InstallError(f"bundle lock file changed while opening: {lock_path}")
-        if metadata.st_nlink != 1 or metadata.st_uid != os.getuid():
-            raise InstallError(f"bundle lock file ownership is unsafe: {lock_path}")
-        if created:
-            os.fchmod(descriptor, 0o600)
-            os.fsync(descriptor)
-            _fsync_directory(codex_home)
-        elif stat.S_IMODE(metadata.st_mode) & 0o077:
-            raise InstallError(f"bundle lock file permissions must be private: {lock_path}")
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as error:
-            if error.errno in {errno.EACCES, errno.EAGAIN}:
+            descriptor = os.open(
+                lock_path, flags | os.O_CREAT | os.O_EXCL, 0o600
+            )
+            created = True
+        except FileExistsError:
+            try:
+                descriptor = os.open(lock_path, flags)
+            except OSError as error:
                 raise InstallError(
-                    "another Agent Work Boundaries install or uninstall operation is running"
+                    f"cannot open bundle lock file {lock_path}: {error}"
                 ) from error
-            raise InstallError(f"cannot acquire bundle lock {lock_path}: {error}") from error
+        except OSError as error:
+            raise InstallError(
+                f"cannot create bundle lock file {lock_path}: {error}"
+            ) from error
+
         try:
-            yield
+            if created:
+                os.fchmod(descriptor, 0o600)
+            opened_identity = _fstat_control_identity(
+                descriptor, lock_path, "bundle lock file"
+            )
+            if created:
+                os.fsync(descriptor)
+                _fsync_directory(codex_home)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno in {errno.EACCES, errno.EAGAIN}:
+                    raise InstallError(
+                        "another Agent Work Boundaries install or uninstall "
+                        "operation is running"
+                    ) from error
+                raise InstallError(
+                    f"cannot acquire bundle lock {lock_path}: {error}"
+                ) from error
+            try:
+                current_identity = _lstat_control_identity(
+                    lock_path, "bundle lock file"
+                )
+                if current_identity != opened_identity:
+                    if attempt == 2:
+                        raise InstallError(
+                            f"bundle lock file changed while acquiring: {lock_path}"
+                        )
+                    continue
+                if (
+                    _fstat_control_identity(
+                        descriptor, lock_path, "bundle lock file"
+                    )
+                    != opened_identity
+                ):
+                    raise InstallError(
+                        f"bundle lock file changed while acquiring: {lock_path}"
+                    )
+                yield
+                return
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-    finally:
-        os.close(descriptor)
+            os.close(descriptor)
+
+    raise InstallError(f"bundle lock file changed repeatedly: {lock_path}")
 
 
 def _journal_path(codex_home: Path) -> Path:
@@ -1014,33 +1091,44 @@ def _validate_journal_document(value: object) -> dict[str, Any]:
     return value
 
 
-def _read_journal(codex_home: Path) -> dict[str, Any] | None:
+def _read_journal_with_identity(
+    codex_home: Path,
+) -> tuple[dict[str, Any], _ControlIdentity] | None:
     path = _journal_path(codex_home)
-    mode = _lstat_mode(path)
-    if mode is None:
-        return None
-    _validate_private_control_entry(path, "transaction journal")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
     except OSError as error:
         raise InstallError(f"cannot open transaction journal {path}: {error}") from error
     try:
-        opened = os.fstat(descriptor)
-        current = path.lstat()
-        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
-            raise InstallError("transaction journal changed while opening")
+        identity = _fstat_control_identity(
+            descriptor, path, "transaction journal"
+        )
+        _require_control_identity(path, "transaction journal", identity)
         payload = os.read(descriptor, 65537)
         if len(payload) > 65536:
             raise InstallError("transaction journal is too large")
+        if (
+            _fstat_control_identity(descriptor, path, "transaction journal")
+            != identity
+        ):
+            raise InstallError("transaction journal changed while reading")
+        _require_control_identity(path, "transaction journal", identity)
     finally:
         os.close(descriptor)
     try:
         value = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise InstallError(f"transaction journal is corrupt: {error}") from error
-    return _validate_journal_document(value)
+    return _validate_journal_document(value), identity
+
+
+def _read_journal(codex_home: Path) -> dict[str, Any] | None:
+    result = _read_journal_with_identity(codex_home)
+    return None if result is None else result[0]
 
 
 def _write_journal(codex_home: Path, document: dict[str, Any]) -> None:
@@ -1053,31 +1141,72 @@ def _write_journal(codex_home: Path, document: dict[str, Any]) -> None:
         raise InstallError(f"transaction journal stage already exists: {temporary}")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    identity: _ControlIdentity | None = None
     try:
         descriptor = os.open(temporary, flags, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(document, stream, sort_keys=True, ensure_ascii=False)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        temporary.chmod(0o600)
-        _fsync_regular_file(temporary)
+        os.fchmod(descriptor, 0o600)
+        identity = _fstat_control_identity(
+            descriptor, temporary, "transaction journal stage"
+        )
+        payload = (
+            json.dumps(document, sort_keys=True, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:  # pragma: no cover - regular-file writes progress
+                raise InstallError("transaction journal write made no progress")
+            offset += written
+        os.fsync(descriptor)
+        if (
+            _fstat_control_identity(
+                descriptor, temporary, "transaction journal stage"
+            )
+            != identity
+        ):
+            raise InstallError("transaction journal stage changed while writing")
+        _require_control_identity(
+            temporary, "transaction journal stage", identity
+        )
         _fsync_directory(codex_home)
         _replace_and_fsync(temporary, journal)
+        if (
+            _fstat_control_identity(
+                descriptor, journal, "transaction journal"
+            )
+            != identity
+        ):
+            raise InstallError("transaction journal changed while publishing")
+        _require_control_identity(journal, "transaction journal", identity)
     except BaseException:
-        if _path_exists(temporary):
-            _remove_path_and_fsync(temporary)
+        if identity is not None:
+            try:
+                _require_control_identity(
+                    temporary, "transaction journal stage", identity
+                )
+            except InstallError:
+                pass
+            else:
+                _unlink_control_and_fsync(
+                    temporary, "transaction journal stage", identity
+                )
         raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _clear_journal(codex_home: Path) -> None:
     journal = _journal_path(codex_home)
-    if not _path_exists(journal):
+    result = _read_journal_with_identity(codex_home)
+    if result is None:
         return
-    document = _read_journal(codex_home)
-    assert document is not None
+    document, identity = result
     try:
-        _unlink_and_fsync(journal)
+        _unlink_control_and_fsync(
+            journal, "transaction journal", identity
+        )
     except Exception as error:
         if not _path_exists(journal):
             try:
@@ -1255,7 +1384,6 @@ def _cleanup_pretransaction(
     for path in (
         _hooks_stage(codex_home, transaction_id),
         _hooks_recovery(codex_home, transaction_id),
-        codex_home / f"{_JOURNAL_NAME}.tmp-{transaction_id}",
     ):
         if _path_exists(path):
             _remove_path_and_fsync(path)
