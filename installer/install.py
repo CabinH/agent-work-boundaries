@@ -30,6 +30,7 @@ _PYTHON_NO_ARGUMENT_OPTIONS = {
     "-x",
 }
 _PYTHON_ARGUMENT_OPTIONS = {"-W", "-X"}
+_PYTHON_CLUSTERABLE_NO_ARGUMENT_FLAGS = frozenset("bBdEiIOPqsSuvx")
 _PYTHON_NON_FILE_OPTIONS = {
     "-c",
     "-m",
@@ -106,6 +107,17 @@ def _python_script_index(parts: list[str], index: int) -> int | None:
             index += 1
             continue
         if option in _PYTHON_NO_ARGUMENT_OPTIONS:
+            index += 1
+            continue
+        if (
+            len(option) > 2
+            and option.startswith("-")
+            and not option.startswith("--")
+            and all(
+                flag in _PYTHON_CLUSTERABLE_NO_ARGUMENT_FLAGS
+                for flag in option[1:]
+            )
+        ):
             index += 1
             continue
         if option.startswith("-"):

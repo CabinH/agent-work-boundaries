@@ -188,6 +188,100 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(once, twice)
         self.assertEqual(sum(target in command for command in commands), 1)
 
+    def test_merge_recognizes_clustered_flags_for_versioned_python(self):
+        target = str(self.hook_script.resolve())
+        managed_commands = [
+            f"/usr/bin/python3.12 -Iu {target}",
+            f"python3 -IE {target}",
+            f"python3 -OOq {target}",
+        ]
+        existing = {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {"type": "command", "command": command}
+                            for command in managed_commands
+                        ]
+                    }
+                ]
+            }
+        }
+        managed = render_managed_hooks(self.hook_script)
+
+        once = merge_hooks(existing, managed)
+        twice = merge_hooks(once, managed)
+        commands = [
+            handler["command"]
+            for group in once["hooks"]["Stop"]
+            for handler in group["hooks"]
+        ]
+
+        self.assertEqual(once, twice)
+        self.assertEqual(sum(target in command for command in commands), 1)
+
+    def test_merge_recognizes_unambiguous_python_argument_options(self):
+        target = str(self.hook_script.resolve())
+        managed_commands = [
+            f"python3 -W ignore {target}",
+            f"python3 -Wignore {target}",
+            f"python3 -X dev {target}",
+            f"python3 -Xdev {target}",
+        ]
+        existing = {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {"type": "command", "command": command}
+                            for command in managed_commands
+                        ]
+                    }
+                ]
+            }
+        }
+
+        result = merge_hooks(existing, render_managed_hooks(self.hook_script))
+        commands = [
+            handler["command"]
+            for group in result["hooks"]["Stop"]
+            for handler in group["hooks"]
+        ]
+
+        self.assertEqual(sum(target in command for command in commands), 1)
+
+    def test_merge_preserves_unknown_or_ambiguous_python_flags(self):
+        target = str(self.hook_script.resolve())
+        unrelated_commands = [
+            f"python3 -Iz {target}",
+            f"python3 -IWignore {target}",
+            f"python3 -W {target}",
+            f"python3 -X {target}",
+            f"python3 -W ignore -Iz {target}",
+        ]
+        existing = {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {"type": "command", "command": command}
+                            for command in unrelated_commands
+                        ]
+                    }
+                ]
+            }
+        }
+
+        result = merge_hooks(existing, render_managed_hooks(self.hook_script))
+        commands = [
+            handler["command"]
+            for group in result["hooks"]["Stop"]
+            for handler in group["hooks"]
+        ]
+
+        for command in unrelated_commands:
+            self.assertIn(command, commands)
+
     def test_merge_preserves_python_linter_that_mentions_managed_path(self):
         target = str(self.hook_script.resolve())
         linter_command = f"python-linter {target}"
