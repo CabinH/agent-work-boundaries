@@ -15,7 +15,7 @@ SCRIPTS_DIR = (
 )
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from app_server_client import AppServerError, LaunchResult
+from app_server_client import AppServerError
 from handoff_service import HandoffService, PublicationRollbackError
 from state_store import StateStore
 
@@ -57,11 +57,6 @@ class RecordingClient:
         )
         self.calls.append((self._cwd, prompt))
         return "turn-new"
-
-    def launch(self, cwd: str, prompt: str) -> LaunchResult:
-        self.calls.append((cwd, prompt))
-        return LaunchResult(thread_id="thr-new", turn_id="turn-new")
-
 
 class FailingClient(RecordingClient):
     def start_thread(self, cwd: str, before_send):
@@ -123,6 +118,7 @@ class FailTurnBeforeSendOnceClient(RecordingClient):
     def __init__(self):
         super().__init__()
         self.turn_attempts = 0
+        self.attempted_prompts = []
 
     def start_turn(
         self,
@@ -132,6 +128,7 @@ class FailTurnBeforeSendOnceClient(RecordingClient):
         before_send,
     ):
         self.turn_attempts += 1
+        self.attempted_prompts.append(prompt)
         if self.turn_attempts == 1:
             raise AppServerError("app server daemon failed to start")
         return super().start_turn(
@@ -638,6 +635,10 @@ class HandoffServiceTests(unittest.TestCase):
         self.assertEqual(interrupted["state"], "thread_created")
         self.assertEqual(interrupted["new_thread_id"], "thr-new")
         self.assertEqual(interrupted["recovery_mode"], "resume_turn_only")
+        self.assertEqual(
+            interrupted["recovery_prompt"],
+            client.attempted_prompts[0],
+        )
 
         result = service.confirm(pending_id)
 

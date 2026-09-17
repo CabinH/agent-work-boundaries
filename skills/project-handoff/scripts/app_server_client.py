@@ -1,4 +1,3 @@
-from dataclasses import dataclass
 import json
 import math
 import queue
@@ -12,12 +11,6 @@ _STDERR_CAPTURE_LIMIT = 4096
 
 class AppServerError(RuntimeError):
     pass
-
-
-@dataclass(frozen=True)
-class LaunchResult:
-    thread_id: str
-    turn_id: str
 
 
 class _BoundedCapture:
@@ -65,109 +58,6 @@ class AppServerClient:
         self._run_command = run_command
         self._popen_factory = popen_factory
         self._request_timeout = timeout
-
-    def launch(
-        self,
-        cwd: str,
-        prompt: str,
-        before_thread_send=lambda: None,
-        before_turn_send=lambda: None,
-        client_user_message_id=None,
-    ) -> LaunchResult:
-        self._start_daemon()
-        process = self._start_proxy()
-        writes = None
-        started_threads = []
-        try:
-            self._validate_proxy_streams(process)
-            responses = queue.Queue()
-            writes = queue.Queue()
-            writer_thread = threading.Thread(
-                target=self._write_stdin,
-                args=(process.stdin, writes),
-                name="project-handoff-app-server-stdin",
-                daemon=True,
-            )
-            stdout_thread = threading.Thread(
-                target=self._read_stdout,
-                args=(process.stdout, responses),
-                name="project-handoff-app-server-stdout",
-                daemon=True,
-            )
-            stderr_capture = _BoundedCapture(_STDERR_CAPTURE_LIMIT)
-            stderr_thread = threading.Thread(
-                target=stderr_capture.drain,
-                args=(process.stderr,),
-                name="project-handoff-app-server-stderr",
-                daemon=True,
-            )
-            writer_thread.start()
-            started_threads.append(writer_thread)
-            stdout_thread.start()
-            started_threads.append(stdout_thread)
-            stderr_thread.start()
-            started_threads.append(stderr_thread)
-
-            self._request(
-                process,
-                responses,
-                writes,
-                1,
-                "initialize",
-                {
-                    "clientInfo": {
-                        "name": "project-handoff",
-                        "version": "0.1.0",
-                    },
-                    "capabilities": {"experimentalApi": True},
-                },
-            )
-            self._send(
-                writes,
-                {"method": "initialized", "params": {}},
-                deadline=time.monotonic() + self._request_timeout,
-            )
-            thread_response = self._request(
-                process,
-                responses,
-                writes,
-                2,
-                "thread/start",
-                {"cwd": cwd},
-                before_send=before_thread_send,
-            )
-            thread_id = self._result_id(
-                thread_response,
-                method="thread/start",
-                object_name="thread",
-            )
-            turn_params = {
-                "threadId": thread_id,
-                "input": [{"type": "text", "text": prompt}],
-            }
-            if client_user_message_id is not None:
-                turn_params["clientUserMessageId"] = client_user_message_id
-            turn_response = self._request(
-                process,
-                responses,
-                writes,
-                3,
-                "turn/start",
-                turn_params,
-                before_send=before_turn_send,
-            )
-            turn_id = self._result_id(
-                turn_response,
-                method="turn/start",
-                object_name="turn",
-            )
-            return LaunchResult(thread_id=thread_id, turn_id=turn_id)
-        finally:
-            self._cleanup_proxy(
-                process,
-                writes,
-                started_threads,
-            )
 
     def start_thread(self, cwd: str, before_send) -> str:
         return self._single_operation(
@@ -332,9 +222,9 @@ class AppServerClient:
         params,
         before_send=None,
     ):
-        deadline = time.monotonic() + self._request_timeout
         if before_send is not None:
             before_send()
+        deadline = time.monotonic() + self._request_timeout
         self._send(
             writes,
             {"id": request_id, "method": method, "params": params},
