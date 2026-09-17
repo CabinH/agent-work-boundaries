@@ -162,6 +162,137 @@ class AppServerClientTests(unittest.TestCase):
 
         self.assertEqual(external_calls, [])
 
+    def test_daemon_start_is_bounded_and_timeout_is_sanitized(self):
+        proxy_started = []
+
+        def timeout_daemon(command, **kwargs):
+            self.assertEqual(kwargs["timeout"], 0.25)
+            raise subprocess.TimeoutExpired(
+                command,
+                kwargs["timeout"],
+                output="Bearer should-not-leak",
+            )
+
+        client = AppServerClient(
+            run_command=timeout_daemon,
+            popen_factory=lambda command, **kwargs: proxy_started.append(command),
+            request_timeout=0.25,
+        )
+
+        with self.assertRaisesRegex(
+            app_server_client.AppServerError,
+            "daemon.*timed out",
+        ) as raised:
+            client.start_thread("/workspace/repo", before_send=lambda: None)
+
+        self.assertNotIn("Bearer", str(raised.exception))
+        self.assertEqual(proxy_started, [])
+
+    def test_start_thread_runs_callback_before_request_can_be_queued(self):
+        process = FakeProcess(
+            [
+                {"id": 1, "result": {"capabilities": {}}},
+                {"id": 2, "result": {"thread": {"id": "thr-new"}}},
+            ]
+        )
+        observed_writes = []
+
+        def before_send():
+            observed_writes.append(process.stdin.getvalue())
+
+        thread_id = self.make_client(process).start_thread(
+            "/workspace/repo",
+            before_send=before_send,
+        )
+
+        self.assertEqual(thread_id, "thr-new")
+        self.assertEqual(len(observed_writes), 1)
+        self.assertNotIn("thread/start", observed_writes[0])
+        self.assertIn("thread/start", process.stdin.getvalue())
+        self.assert_proxy_cleaned_up(process)
+
+    def test_callback_failure_prevents_thread_request(self):
+        process = FakeProcess(
+            [{"id": 1, "result": {"capabilities": {}}}]
+        )
+        callback_error = OSError("durable state unavailable")
+
+        with self.assertRaises(OSError) as raised:
+            self.make_client(process).start_thread(
+                "/workspace/repo",
+                before_send=lambda: (_ for _ in ()).throw(callback_error),
+            )
+
+        self.assertIs(raised.exception, callback_error)
+        methods = [
+            json.loads(line)["method"]
+            for line in process.stdin.getvalue().splitlines()
+        ]
+        self.assertEqual(methods, ["initialize", "initialized"])
+        self.assert_proxy_cleaned_up(process)
+
+    def test_start_turn_sends_stable_client_user_message_id(self):
+        process = FakeProcess(
+            [
+                {"id": 1, "result": {"capabilities": {}}},
+                {"id": 2, "result": {"turn": {"id": "turn-new"}}},
+            ]
+        )
+        callback_calls = []
+
+        turn_id = self.make_client(process).start_turn(
+            "thr-new",
+            "resume from the handoff",
+            "project-handoff:pending-123",
+            before_send=lambda: callback_calls.append("persisted"),
+        )
+
+        self.assertEqual(turn_id, "turn-new")
+        self.assertEqual(callback_calls, ["persisted"])
+        messages = [
+            json.loads(line) for line in process.stdin.getvalue().splitlines()
+        ]
+        self.assertEqual(
+            messages[-1],
+            {
+                "id": 2,
+                "method": "turn/start",
+                "params": {
+                    "threadId": "thr-new",
+                    "clientUserMessageId": "project-handoff:pending-123",
+                    "input": [
+                        {
+                            "type": "text",
+                            "text": "resume from the handoff",
+                        }
+                    ],
+                },
+            },
+        )
+        self.assert_proxy_cleaned_up(process)
+
+    def test_callback_failure_prevents_turn_request(self):
+        process = FakeProcess(
+            [{"id": 1, "result": {"capabilities": {}}}]
+        )
+        callback_error = OSError("durable turn state unavailable")
+
+        with self.assertRaises(OSError) as raised:
+            self.make_client(process).start_turn(
+                "thr-new",
+                "resume from the handoff",
+                "project-handoff:pending-123",
+                before_send=lambda: (_ for _ in ()).throw(callback_error),
+            )
+
+        self.assertIs(raised.exception, callback_error)
+        methods = [
+            json.loads(line)["method"]
+            for line in process.stdin.getvalue().splitlines()
+        ]
+        self.assertEqual(methods, ["initialize", "initialized"])
+        self.assert_proxy_cleaned_up(process)
+
     def test_launch_preserves_worker_start_failure_and_cleans_up(self):
         process = FakeProcess()
         client = self.make_client(process)
@@ -397,6 +528,7 @@ class AppServerClientTests(unittest.TestCase):
                         "check": True,
                         "capture_output": True,
                         "text": True,
+                        "timeout": 1.0,
                     },
                 )
             ],

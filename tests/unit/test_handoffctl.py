@@ -103,6 +103,57 @@ class HandoffCtlTests(unittest.TestCase):
         self.assertTrue(stdout.endswith("\n"))
         self.assertEqual(stderr, "")
 
+    def test_status_distinguishes_retry_and_manual_inspection_modes(self):
+        pending_id = self.prepare()
+        self.service.arm(pending_id, "thr-old", 300)
+        self.service.store.claim_confirm(pending_id)
+        self.service.store.mark_thread_starting(
+            pending_id,
+            recovery_prompt="Inspect the external thread outcome manually.",
+        )
+        self.service.store.mark_indeterminate(
+            pending_id,
+            error_summary="thread/start response was lost",
+            recovery_prompt="Inspect the external thread outcome manually.",
+        )
+
+        code, payload, _stdout, _stderr = self.invoke(
+            "status",
+            "--session-id",
+            "thr-old",
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["state"], "indeterminate")
+        self.assertEqual(payload["recovery_mode"], "inspect_external_outcome")
+        self.assertFalse(payload["retryable"])
+        self.assertIn("recovery_prompt", payload)
+
+    def test_confirm_refuses_indeterminate_transfer(self):
+        pending_id = self.prepare()
+        self.service.arm(pending_id, "thr-old", 300)
+        self.service.store.claim_confirm(pending_id)
+        self.service.store.mark_thread_starting(
+            pending_id,
+            recovery_prompt="Inspect the external thread outcome manually.",
+        )
+        self.service.store.mark_indeterminate(
+            pending_id,
+            error_summary="thread/start response was lost",
+            recovery_prompt="Inspect the external thread outcome manually.",
+        )
+
+        code, payload, _stdout, _stderr = self.invoke(
+            "confirm",
+            "--pending-id",
+            pending_id,
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(payload, {"result": None})
+        self.assertEqual(self.client.thread_calls, [])
+        self.assertEqual(self.client.turn_calls, [])
+
     def test_respond_outputs_responded_record(self):
         pending_id = self.prepare()
         self.invoke(

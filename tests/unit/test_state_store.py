@@ -218,6 +218,15 @@ class StateStoreTests(unittest.TestCase):
         record = store.prepare("/repo", "handoff", "/repo/AI-HANDOFF.md")
         store.arm(record["pending_id"], "thr-old", timeout_seconds=300)
         store.claim_confirm(record["pending_id"])
+        store.mark_thread_starting(
+            record["pending_id"],
+            recovery_prompt="Inspect the thread/start outcome before retrying.",
+        )
+        store.mark_thread_created(record["pending_id"], "thr-new")
+        store.mark_turn_starting(
+            record["pending_id"],
+            client_user_message_id=f'project-handoff:{record["pending_id"]}',
+        )
 
         transferred = store.mark_transferred(record["pending_id"], "thr-new")
 
@@ -250,6 +259,92 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(retried["recovery_prompt"], failed["recovery_prompt"])
         self.assertEqual(self.read_pending(record["pending_id"]), retried)
         self.assertEqual(self.read_session("thr-old"), retried)
+
+    def test_external_effect_phases_persist_recovery_information(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+        record = store.prepare("/repo", "handoff", "/repo/AI-HANDOFF.md")
+        store.arm(record["pending_id"], "thr-old", timeout_seconds=300)
+        store.claim_confirm(record["pending_id"])
+
+        thread_starting = store.mark_thread_starting(
+            record["pending_id"],
+            recovery_prompt="Inspect thread creation manually.",
+        )
+        thread_created = store.mark_thread_created(
+            record["pending_id"],
+            "thr-new",
+        )
+        turn_starting = store.mark_turn_starting(
+            record["pending_id"],
+            client_user_message_id=f'project-handoff:{record["pending_id"]}',
+        )
+        transferred = store.mark_transferred(record["pending_id"], "thr-new")
+
+        self.assertEqual(thread_starting["state"], "thread_starting")
+        self.assertEqual(
+            thread_starting["recovery_prompt"],
+            "Inspect thread creation manually.",
+        )
+        self.assertEqual(thread_created["state"], "thread_created")
+        self.assertEqual(thread_created["new_thread_id"], "thr-new")
+        self.assertEqual(turn_starting["state"], "turn_starting")
+        self.assertEqual(
+            turn_starting["client_user_message_id"],
+            f'project-handoff:{record["pending_id"]}',
+        )
+        self.assertEqual(transferred["state"], "transferred")
+
+    def test_confirm_resumes_thread_created_but_refuses_ambiguous_phases(self):
+        for phase in ("thread_starting", "turn_starting", "indeterminate"):
+            with self.subTest(phase=phase):
+                case_root = self.root / phase
+                store = StateStore(case_root, now=lambda: 100.0)
+                record = store.prepare("/repo", "handoff", "/repo/AI-HANDOFF.md")
+                store.arm(record["pending_id"], "thr-old", timeout_seconds=300)
+                store.claim_confirm(record["pending_id"])
+                store.mark_thread_starting(
+                    record["pending_id"],
+                    recovery_prompt="Inspect before retrying.",
+                )
+                if phase in {"turn_starting", "indeterminate"}:
+                    store.mark_thread_created(record["pending_id"], "thr-new")
+                    store.mark_turn_starting(
+                        record["pending_id"],
+                        client_user_message_id=(
+                            f'project-handoff:{record["pending_id"]}'
+                        ),
+                    )
+                if phase == "indeterminate":
+                    store.mark_indeterminate(
+                        record["pending_id"],
+                        error_summary="turn/start response was lost",
+                        recovery_prompt="Inspect the existing thread manually.",
+                    )
+
+                self.assertIsNone(store.claim_confirm(record["pending_id"]))
+
+        resumable_store = StateStore(self.root / "resumable", now=lambda: 100.0)
+        resumable = resumable_store.prepare(
+            "/repo",
+            "handoff",
+            "/repo/AI-HANDOFF.md",
+        )
+        resumable_store.arm(
+            resumable["pending_id"],
+            "thr-old",
+            timeout_seconds=300,
+        )
+        resumable_store.claim_confirm(resumable["pending_id"])
+        resumable_store.mark_thread_starting(
+            resumable["pending_id"],
+            recovery_prompt="Inspect before retrying.",
+        )
+        resumable_store.mark_thread_created(resumable["pending_id"], "thr-new")
+
+        claimed = resumable_store.claim_confirm(resumable["pending_id"])
+
+        self.assertEqual(claimed["state"], "thread_created")
+        self.assertEqual(claimed["new_thread_id"], "thr-new")
 
     def test_invalid_pending_id_is_rejected(self):
         store = StateStore(self.root, now=lambda: 100.0)

@@ -17,8 +17,12 @@ LEGAL_TRANSITIONS = {
     "armed": {"responded", "expired", "transferring", "cancelled"},
     "responded": {"transferring", "cancelled"},
     "expired": {"transferring"},
-    "transferring": {"transferred", "failed"},
+    "transferring": {"thread_starting", "failed"},
+    "thread_starting": {"thread_created", "indeterminate"},
+    "thread_created": {"turn_starting"},
+    "turn_starting": {"transferred", "indeterminate"},
     "failed": {"transferring", "cancelled"},
+    "indeterminate": set(),
     "transferred": set(),
     "cancelled": set(),
 }
@@ -98,6 +102,8 @@ class StateStore:
     def claim_confirm(self, pending_id: str) -> dict[str, object] | None:
         with self._locked(pending_id):
             record = self._read_record(self._pending_path(pending_id))
+            if record["state"] == "thread_created":
+                return record
             if record["state"] not in {"armed", "responded", "failed"}:
                 return None
             self._set_state(record, "transferring")
@@ -122,6 +128,51 @@ class StateStore:
             self._persist(record)
             return record
 
+    def mark_thread_starting(
+        self,
+        pending_id: str,
+        recovery_prompt: str,
+    ) -> dict[str, object] | None:
+        with self._locked(pending_id):
+            record = self._read_record(self._pending_path(pending_id))
+            if record["state"] != "transferring":
+                return None
+            self._set_state(record, "thread_starting")
+            record["recovery_prompt"] = recovery_prompt
+            record["thread_starting_at"] = self.now()
+            self._persist(record)
+            return record
+
+    def mark_thread_created(
+        self,
+        pending_id: str,
+        new_thread_id: str,
+    ) -> dict[str, object] | None:
+        with self._locked(pending_id):
+            record = self._read_record(self._pending_path(pending_id))
+            if record["state"] != "thread_starting":
+                return None
+            self._set_state(record, "thread_created")
+            record["new_thread_id"] = new_thread_id
+            record["thread_created_at"] = self.now()
+            self._persist(record)
+            return record
+
+    def mark_turn_starting(
+        self,
+        pending_id: str,
+        client_user_message_id: str,
+    ) -> dict[str, object] | None:
+        with self._locked(pending_id):
+            record = self._read_record(self._pending_path(pending_id))
+            if record["state"] != "thread_created":
+                return None
+            self._set_state(record, "turn_starting")
+            record["client_user_message_id"] = client_user_message_id
+            record["turn_starting_at"] = self.now()
+            self._persist(record)
+            return record
+
     def mark_transferred(
         self,
         pending_id: str,
@@ -129,11 +180,32 @@ class StateStore:
     ) -> dict[str, object] | None:
         with self._locked(pending_id):
             record = self._read_record(self._pending_path(pending_id))
-            if record["state"] != "transferring":
+            if record["state"] != "turn_starting":
                 return None
+            recorded_thread_id = record.get("new_thread_id")
+            if recorded_thread_id != new_thread_id:
+                raise ValueError("new thread id does not match durable state")
             self._set_state(record, "transferred")
-            record["new_thread_id"] = new_thread_id
             record["transferred_at"] = self.now()
+            self._persist(record)
+            return record
+
+    def mark_indeterminate(
+        self,
+        pending_id: str,
+        error_summary: str,
+        recovery_prompt: str,
+    ) -> dict[str, object] | None:
+        with self._locked(pending_id):
+            record = self._read_record(self._pending_path(pending_id))
+            state = str(record["state"])
+            if state not in {"thread_starting", "turn_starting"}:
+                return None
+            self._set_state(record, "indeterminate")
+            record["external_phase"] = state
+            record["error_summary"] = error_summary
+            record["recovery_prompt"] = recovery_prompt
+            record["indeterminate_at"] = self.now()
             self._persist(record)
             return record
 

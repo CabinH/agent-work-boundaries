@@ -90,9 +90,38 @@ class HandoffService:
             return self._transfer_claimed(claimed)
 
     def status(self, session_id):
-        return self.store.get_session_status(session_id)
+        record = self.store.get_session_status(session_id)
+        if record is None:
+            return None
+        status = dict(record)
+        state = str(status.get("state"))
+        if state == "failed":
+            status.update(
+                retryable=True,
+                recovery_mode="retry_full_transfer",
+                inspection_required=False,
+            )
+        elif state == "thread_created":
+            status.update(
+                retryable=True,
+                recovery_mode="resume_turn_only",
+                inspection_required=False,
+            )
+        elif state in {"thread_starting", "turn_starting", "indeterminate"}:
+            status.update(
+                retryable=False,
+                recovery_mode="inspect_external_outcome",
+                inspection_required=True,
+            )
+        return status
 
     def _transfer_claimed(self, record):
+        if record["state"] == "thread_created":
+            return self._start_turn(
+                record,
+                str(record["recovery_prompt"]),
+            )
+
         handoff_path = None
         try:
             target = self._project_target(record)
@@ -103,27 +132,133 @@ class HandoffService:
                 str(record["handoff_text"]),
             )
             prompt = self._resume_prompt(record, handoff_path)
-            launched = self.app_server_client.launch(str(record["cwd"]), prompt)
-            return self.store.mark_transferred(
-                str(record["pending_id"]),
-                launched.thread_id,
+        except Exception as error:
+            recovery_prompt = self._recovery_prompt_after_failure(
+                record,
+                handoff_path,
+            )
+            self._mark_failed_without_masking(record, error, recovery_prompt)
+            raise
+
+        pending_id = str(record["pending_id"])
+        callback_completed = False
+
+        def before_thread_send():
+            nonlocal callback_completed
+            phase = self.store.mark_thread_starting(
+                pending_id,
+                prompt,
+            )
+            if phase is None:
+                raise RuntimeError("thread/start phase could not be claimed")
+            callback_completed = True
+
+        try:
+            thread_id = self.app_server_client.start_thread(
+                str(record["cwd"]),
+                before_send=before_thread_send,
             )
         except Exception as error:
-            if handoff_path is None:
-                recovery_path = self._private_target(str(record["pending_id"]))
-                try:
-                    self._publish_private(recovery_path, str(record["handoff_text"]))
-                except OSError:
-                    pass
+            if callback_completed:
+                self._mark_indeterminate_without_masking(
+                    pending_id,
+                    error,
+                    prompt,
+                )
             else:
-                recovery_path = handoff_path
-            recovery_prompt = self._format_resume_prompt(record, recovery_path)
+                self._mark_failed_without_masking(record, error, prompt)
+            raise
+
+        try:
+            thread_created = self.store.mark_thread_created(
+                pending_id,
+                thread_id,
+            )
+            if thread_created is None:
+                raise RuntimeError("thread id could not be persisted")
+        except Exception:
+            # The returned thread exists, but its identifier may not be durable.
+            # Keep thread_starting non-reclaimable rather than guessing and retrying.
+            raise
+        return self._start_turn(thread_created, prompt)
+
+    def _start_turn(self, record, prompt):
+        pending_id = str(record["pending_id"])
+        thread_id = str(record["new_thread_id"])
+        client_user_message_id = self._client_user_message_id(pending_id)
+        callback_completed = False
+
+        def before_turn_send():
+            nonlocal callback_completed
+            phase = self.store.mark_turn_starting(
+                pending_id,
+                client_user_message_id,
+            )
+            if phase is None:
+                raise RuntimeError("turn/start phase could not be claimed")
+            callback_completed = True
+
+        try:
+            self.app_server_client.start_turn(
+                thread_id,
+                prompt,
+                client_user_message_id,
+                before_send=before_turn_send,
+            )
+        except Exception as error:
+            if callback_completed:
+                self._mark_indeterminate_without_masking(
+                    pending_id,
+                    error,
+                    prompt,
+                )
+            raise
+
+        # If this write fails, turn_starting remains durable and non-reclaimable.
+        transferred = self.store.mark_transferred(pending_id, thread_id)
+        if transferred is None:
+            raise RuntimeError("transferred state could not be persisted")
+        return transferred
+
+    def _recovery_prompt_after_failure(self, record, handoff_path):
+        if handoff_path is None:
+            recovery_path = self._private_target(str(record["pending_id"]))
+            try:
+                self._publish_private(recovery_path, str(record["handoff_text"]))
+            except OSError:
+                pass
+        else:
+            recovery_path = handoff_path
+        return self._format_resume_prompt(record, recovery_path)
+
+    def _mark_failed_without_masking(self, record, error, recovery_prompt):
+        try:
             self.store.mark_failed(
                 str(record["pending_id"]),
                 self._error_summary(error),
                 recovery_prompt,
             )
-            raise
+        except Exception:
+            pass
+
+    def _mark_indeterminate_without_masking(
+        self,
+        pending_id,
+        error,
+        recovery_prompt,
+    ):
+        try:
+            self.store.mark_indeterminate(
+                pending_id,
+                self._error_summary(error),
+                recovery_prompt,
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _client_user_message_id(pending_id):
+        return f"project-handoff:{pending_id}"
 
     def _pending_record(self, pending_id):
         try:

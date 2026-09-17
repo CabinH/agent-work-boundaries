@@ -66,7 +66,14 @@ class AppServerClient:
         self._popen_factory = popen_factory
         self._request_timeout = timeout
 
-    def launch(self, cwd: str, prompt: str) -> LaunchResult:
+    def launch(
+        self,
+        cwd: str,
+        prompt: str,
+        before_thread_send=lambda: None,
+        before_turn_send=lambda: None,
+        client_user_message_id=None,
+    ) -> LaunchResult:
         self._start_daemon()
         process = self._start_proxy()
         writes = None
@@ -127,22 +134,27 @@ class AppServerClient:
                 2,
                 "thread/start",
                 {"cwd": cwd},
+                before_send=before_thread_send,
             )
             thread_id = self._result_id(
                 thread_response,
                 method="thread/start",
                 object_name="thread",
             )
+            turn_params = {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": prompt}],
+            }
+            if client_user_message_id is not None:
+                turn_params["clientUserMessageId"] = client_user_message_id
             turn_response = self._request(
                 process,
                 responses,
                 writes,
                 3,
                 "turn/start",
-                {
-                    "threadId": thread_id,
-                    "input": [{"type": "text", "text": prompt}],
-                },
+                turn_params,
+                before_send=before_turn_send,
             )
             turn_id = self._result_id(
                 turn_response,
@@ -157,6 +169,113 @@ class AppServerClient:
                 started_threads,
             )
 
+    def start_thread(self, cwd: str, before_send) -> str:
+        return self._single_operation(
+            method="thread/start",
+            params={"cwd": cwd},
+            object_name="thread",
+            before_send=before_send,
+        )
+
+    def start_turn(
+        self,
+        thread_id: str,
+        prompt: str,
+        client_user_message_id: str,
+        before_send,
+    ) -> str:
+        return self._single_operation(
+            method="turn/start",
+            params={
+                "threadId": thread_id,
+                "clientUserMessageId": client_user_message_id,
+                "input": [{"type": "text", "text": prompt}],
+            },
+            object_name="turn",
+            before_send=before_send,
+        )
+
+    def _single_operation(
+        self,
+        method,
+        params,
+        object_name,
+        before_send,
+    ):
+        self._start_daemon()
+        process = self._start_proxy()
+        writes = None
+        started_threads = []
+        try:
+            self._validate_proxy_streams(process)
+            responses = queue.Queue()
+            writes = queue.Queue()
+            worker_specs = (
+                (
+                    self._write_stdin,
+                    (process.stdin, writes),
+                    "project-handoff-app-server-stdin",
+                ),
+                (
+                    self._read_stdout,
+                    (process.stdout, responses),
+                    "project-handoff-app-server-stdout",
+                ),
+            )
+            stderr_capture = _BoundedCapture(_STDERR_CAPTURE_LIMIT)
+            worker_specs += (
+                (
+                    stderr_capture.drain,
+                    (process.stderr,),
+                    "project-handoff-app-server-stderr",
+                ),
+            )
+            for target, args, name in worker_specs:
+                worker = threading.Thread(
+                    target=target,
+                    args=args,
+                    name=name,
+                    daemon=True,
+                )
+                worker.start()
+                started_threads.append(worker)
+
+            self._request(
+                process,
+                responses,
+                writes,
+                1,
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "project-handoff",
+                        "version": "0.1.0",
+                    },
+                    "capabilities": {"experimentalApi": True},
+                },
+            )
+            self._send(
+                writes,
+                {"method": "initialized", "params": {}},
+                deadline=time.monotonic() + self._request_timeout,
+            )
+            response = self._request(
+                process,
+                responses,
+                writes,
+                2,
+                method,
+                params,
+                before_send=before_send,
+            )
+            return self._result_id(
+                response,
+                method=method,
+                object_name=object_name,
+            )
+        finally:
+            self._cleanup_proxy(process, writes, started_threads)
+
     def _start_daemon(self):
         try:
             result = self._run_command(
@@ -164,7 +283,12 @@ class AppServerClient:
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=self._request_timeout,
             )
+        except subprocess.TimeoutExpired:
+            raise AppServerError(
+                "app server daemon timed out while starting"
+            ) from None
         except subprocess.CalledProcessError as error:
             raise AppServerError(
                 "app server daemon failed to start "
@@ -198,8 +322,19 @@ class AppServerClient:
         if process.stdin is None or process.stdout is None or process.stderr is None:
             raise AppServerError("app server proxy streams are unavailable")
 
-    def _request(self, process, responses, writes, request_id, method, params):
+    def _request(
+        self,
+        process,
+        responses,
+        writes,
+        request_id,
+        method,
+        params,
+        before_send=None,
+    ):
         deadline = time.monotonic() + self._request_timeout
+        if before_send is not None:
+            before_send()
         self._send(
             writes,
             {"id": request_id, "method": method, "params": params},
@@ -259,12 +394,13 @@ class AppServerClient:
 
     @staticmethod
     def _send(writes, message, deadline):
-        completion = queue.Queue(maxsize=1)
-        writes.put((json.dumps(message) + "\n", completion))
+        payload = json.dumps(message) + "\n"
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             method = message.get("method", "request")
             raise AppServerError(f"{method} timed out while sending")
+        completion = queue.Queue(maxsize=1)
+        writes.put((payload, completion))
         try:
             error = completion.get(timeout=remaining)
         except queue.Empty:

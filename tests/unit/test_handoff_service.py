@@ -15,7 +15,7 @@ SCRIPTS_DIR = (
 )
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from app_server_client import LaunchResult
+from app_server_client import AppServerError, LaunchResult
 from handoff_service import HandoffService, PublicationRollbackError
 from state_store import StateStore
 
@@ -34,6 +34,29 @@ Add the integration fixture.
 class RecordingClient:
     def __init__(self):
         self.calls = []
+        self.thread_calls = []
+        self.turn_calls = []
+        self._cwd = None
+
+    def start_thread(self, cwd: str, before_send):
+        before_send()
+        self._cwd = cwd
+        self.thread_calls.append(cwd)
+        return "thr-new"
+
+    def start_turn(
+        self,
+        thread_id: str,
+        prompt: str,
+        client_user_message_id: str,
+        before_send,
+    ):
+        before_send()
+        self.turn_calls.append(
+            (thread_id, prompt, client_user_message_id)
+        )
+        self.calls.append((self._cwd, prompt))
+        return "turn-new"
 
     def launch(self, cwd: str, prompt: str) -> LaunchResult:
         self.calls.append((cwd, prompt))
@@ -41,8 +64,8 @@ class RecordingClient:
 
 
 class FailingClient(RecordingClient):
-    def launch(self, cwd: str, prompt: str) -> LaunchResult:
-        self.calls.append((cwd, prompt))
+    def start_thread(self, cwd: str, before_send):
+        self.thread_calls.append(cwd)
         raise RuntimeError("launch failed: " + "x" * 2_000)
 
 
@@ -50,7 +73,8 @@ class FileRecordingClient:
     def __init__(self, path):
         self.path = path
 
-    def launch(self, cwd: str, prompt: str) -> LaunchResult:
+    def start_thread(self, cwd: str, before_send):
+        before_send()
         descriptor = os.open(
             self.path,
             os.O_WRONLY | os.O_CREAT | os.O_APPEND,
@@ -60,7 +84,62 @@ class FileRecordingClient:
             os.write(descriptor, b"launch\n")
         finally:
             os.close(descriptor)
-        return LaunchResult(thread_id="thr-new", turn_id="turn-new")
+        return "thr-new"
+
+    def start_turn(
+        self,
+        thread_id: str,
+        prompt: str,
+        client_user_message_id: str,
+        before_send,
+    ):
+        before_send()
+        return "turn-new"
+
+
+class AmbiguousThreadClient(RecordingClient):
+    def start_thread(self, cwd: str, before_send):
+        before_send()
+        self.thread_calls.append(cwd)
+        raise AppServerError("thread/start timed out waiting for response")
+
+
+class AmbiguousTurnClient(RecordingClient):
+    def start_turn(
+        self,
+        thread_id: str,
+        prompt: str,
+        client_user_message_id: str,
+        before_send,
+    ):
+        before_send()
+        self.turn_calls.append(
+            (thread_id, prompt, client_user_message_id)
+        )
+        raise AppServerError("turn/start failed because the proxy closed")
+
+
+class FailTurnBeforeSendOnceClient(RecordingClient):
+    def __init__(self):
+        super().__init__()
+        self.turn_attempts = 0
+
+    def start_turn(
+        self,
+        thread_id: str,
+        prompt: str,
+        client_user_message_id: str,
+        before_send,
+    ):
+        self.turn_attempts += 1
+        if self.turn_attempts == 1:
+            raise AppServerError("app server daemon failed to start")
+        return super().start_turn(
+            thread_id,
+            prompt,
+            client_user_message_id,
+            before_send,
+        )
 
 
 class FakeClock:
@@ -430,8 +509,142 @@ class HandoffServiceTests(unittest.TestCase):
         status = service.status("thr-old")
         self.assertEqual(status["state"], "failed")
         self.assertLessEqual(len(status["error_summary"]), 512)
-        self.assertEqual(status["recovery_prompt"], client.calls[0][1])
+        self.assertIn(str(target), status["recovery_prompt"])
+        self.assertEqual(status["recovery_mode"], "retry_full_transfer")
+        self.assertTrue(status["retryable"])
         self.assertEqual(target.read_text(), VALID_HANDOFF)
+
+    def test_ambiguous_thread_start_is_indeterminate_and_not_retried(self):
+        service, client, _clock = self.make_service(
+            client=AmbiguousThreadClient()
+        )
+        pending_id, target = self.prepare_armed(service)
+
+        with self.assertRaisesRegex(AppServerError, "thread/start.*timed out"):
+            service.confirm(pending_id)
+
+        status = service.status("thr-old")
+        self.assertEqual(status["state"], "indeterminate")
+        self.assertEqual(status["external_phase"], "thread_starting")
+        self.assertFalse(status["retryable"])
+        self.assertEqual(status["recovery_mode"], "inspect_external_outcome")
+        self.assertIn(str(target), status["recovery_prompt"])
+        self.assertIsNone(service.confirm(pending_id))
+        self.assertEqual(client.thread_calls, [str(self.root)])
+        self.assertEqual(client.turn_calls, [])
+
+    def test_ambiguous_turn_start_is_indeterminate_and_keeps_thread_id(self):
+        service, client, _clock = self.make_service(
+            client=AmbiguousTurnClient()
+        )
+        pending_id, _target = self.prepare_armed(service)
+
+        with self.assertRaisesRegex(AppServerError, "turn/start.*proxy closed"):
+            service.confirm(pending_id)
+
+        status = service.status("thr-old")
+        self.assertEqual(status["state"], "indeterminate")
+        self.assertEqual(status["external_phase"], "turn_starting")
+        self.assertEqual(status["new_thread_id"], "thr-new")
+        self.assertEqual(
+            status["client_user_message_id"],
+            f"project-handoff:{pending_id}",
+        )
+        self.assertFalse(status["retryable"])
+        self.assertIsNone(service.confirm(pending_id))
+        self.assertEqual(client.thread_calls, [str(self.root)])
+        self.assertEqual(len(client.turn_calls), 1)
+
+    def test_thread_id_persistence_failure_keeps_non_reclaimable_phase(self):
+        service, client, _clock = self.make_service()
+        pending_id, _target = self.prepare_armed(service)
+
+        with mock.patch.object(
+            service.store,
+            "mark_thread_created",
+            side_effect=OSError("thread id persistence failed"),
+        ):
+            with self.assertRaisesRegex(OSError, "thread id persistence failed"):
+                service.confirm(pending_id)
+
+        status = service.status("thr-old")
+        self.assertEqual(status["state"], "thread_starting")
+        self.assertEqual(status["recovery_mode"], "inspect_external_outcome")
+        self.assertFalse(status["retryable"])
+        self.assertIsNone(service.confirm(pending_id))
+        self.assertEqual(client.thread_calls, [str(self.root)])
+        self.assertEqual(client.turn_calls, [])
+
+    def test_transferred_persistence_failure_keeps_turn_starting_phase(self):
+        service, client, _clock = self.make_service()
+        pending_id, _target = self.prepare_armed(service)
+
+        with mock.patch.object(
+            service.store,
+            "mark_transferred",
+            side_effect=OSError("final persistence failed"),
+        ):
+            with self.assertRaisesRegex(OSError, "final persistence failed"):
+                service.confirm(pending_id)
+
+        status = service.status("thr-old")
+        self.assertEqual(status["state"], "turn_starting")
+        self.assertEqual(status["new_thread_id"], "thr-new")
+        self.assertEqual(status["recovery_mode"], "inspect_external_outcome")
+        self.assertFalse(status["retryable"])
+        self.assertIsNone(service.confirm(pending_id))
+        self.assertEqual(len(client.thread_calls), 1)
+        self.assertEqual(len(client.turn_calls), 1)
+
+    def test_thread_created_confirm_resumes_only_existing_thread_turn(self):
+        service, client, _clock = self.make_service()
+        pending_id, target = self.prepare_armed(service)
+        service.store.claim_confirm(pending_id)
+        recovery_prompt = service._format_resume_prompt(
+            service._pending_record(pending_id),
+            target,
+        )
+        service.store.mark_thread_starting(pending_id, recovery_prompt)
+        service.store.mark_thread_created(pending_id, "thr-existing")
+
+        status = service.status("thr-old")
+
+        self.assertEqual(status["state"], "thread_created")
+        self.assertEqual(status["recovery_mode"], "resume_turn_only")
+        self.assertTrue(status["retryable"])
+
+        result = service.confirm(pending_id)
+
+        self.assertEqual(result["state"], "transferred")
+        self.assertEqual(result["new_thread_id"], "thr-existing")
+        self.assertEqual(client.thread_calls, [])
+        self.assertEqual(len(client.turn_calls), 1)
+        self.assertEqual(client.turn_calls[0][0], "thr-existing")
+        self.assertEqual(
+            client.turn_calls[0][2],
+            f"project-handoff:{pending_id}",
+        )
+
+    def test_pre_send_turn_failure_resumes_without_creating_another_thread(self):
+        service, client, _clock = self.make_service(
+            client=FailTurnBeforeSendOnceClient()
+        )
+        pending_id, _target = self.prepare_armed(service)
+
+        with self.assertRaisesRegex(AppServerError, "daemon failed"):
+            service.confirm(pending_id)
+
+        interrupted = service.status("thr-old")
+        self.assertEqual(interrupted["state"], "thread_created")
+        self.assertEqual(interrupted["new_thread_id"], "thr-new")
+        self.assertEqual(interrupted["recovery_mode"], "resume_turn_only")
+
+        result = service.confirm(pending_id)
+
+        self.assertEqual(result["state"], "transferred")
+        self.assertEqual(client.thread_calls, [str(self.root)])
+        self.assertEqual(client.turn_attempts, 2)
+        self.assertEqual(len(client.turn_calls), 1)
 
     def test_worker_exception_marks_failed_for_recovery(self):
         service, _client, _clock = self.make_service()
