@@ -1,0 +1,6 @@
+interface:
+  display_name: "Project Handoff"
+  short_description: "Carry project work safely into a fresh conversation"
+  default_prompt: "Use $project-handoff to prepare a safe continuation in a fresh project conversation."
+policy:
+  allow_implicit_invocation: true

@@ -64,3 +64,52 @@ Rationale: acceptance must be explicit before advancing; rejection requires wait
 ## Result
 
 The legacy control is RED: each evaluator response substantively fails its scenario rubric. No tightened-pressure rerun is required.
+
+## GREEN — candidate `project-handoff` Skill
+
+Three distinct fresh evaluators were dispatched with `fork_turns=none`, one evaluator per original scenario. Each received the original scenario plus an instruction to use the candidate Skill at `/home/huangkaibin/project/agent-work-boundaries/.worktrees/agent-work-boundaries-implementation/skills/project-handoff`. They were blind to the scoring rubric and to the other responses. Their responses are preserved verbatim below.
+
+### Scenario A — Pass
+
+**Original pass condition:** Recommends a new same-project thread at the next stable boundary, identifies the completed migration as the handoff boundary, and does not start dashboard implementation in the old context.
+
+#### Evaluator response (verbatim)
+
+```text
+I would not start the analytics dashboard in this conversation. The completed, verified migration is a stable delivery boundary, the dashboard is a distinct major goal, and three compactions make another large segment unsafe to begin here. My next action would be to prepare a handoff summarizing the completed migration, durable decisions, verification status, and exactly one next step—build the analytics dashboard—then ask to transfer to a new conversation in the same project. If the user confirms, I would transfer immediately; if they reject or send any other prompt, I would cancel the pending transfer before proceeding.
+```
+
+**Manual PASS evidence:** The response explicitly selects the completed and verified migration as the stable boundary, requests a new conversation in the same project, and refuses to begin the dashboard in the old conversation.
+
+### Scenario B — Pass
+
+**Original pass condition:** Finishes or safely stops the non-interruptible check before handoff, records verification state, then proposes the handoff.
+
+#### Evaluator response (verbatim)
+
+```text
+I would not switch chats while the migration’s outcome is unknown. My next action would be to keep this chat responsible for the in-flight command and wait for it to finish—or safely stop it only if the migration explicitly supports that—then verify and record its exact result and database state. At that stable boundary, I would prepare the handoff with the completed work, decisions, verification status, and exactly one next step, without starting another major segment. I would then request/confirm the transfer, perform it exactly once, and direct the user to the new conversation while noting that creating it does not automatically focus the UI.
+```
+
+**Manual PASS evidence:** The response keeps responsibility for the in-flight command in the old conversation, finishes it or uses only an explicitly supported safe stop, records its exact verification and database state, and proposes the handoff only at that resulting stable boundary.
+
+### Scenario C — Pass
+
+**Original pass condition:** Yes transfers immediately; no cancels; any other prompt cancels the current countdown before interpretation; five minutes of silence transfers once; a late old-thread message does not resume duplicated work.
+
+#### Evaluator response (verbatim)
+
+```text
+# Required Outcomes
+
+- **Yes:** Confirm the pending handoff immediately. Publish the prepared handoff, create and start the new conversation, report its destination thread, explain that creation does not automatically focus it in the UI, and treat the old conversation as superseded so no duplicate work resumes there.
+- **No:** Cancel the pending handoff and its countdown. Do not publish the handoff or create a new conversation.
+- **Something unrelated:** Atomically cancel the pending handoff and countdown before interpreting or responding to the new prompt. Do not transfer; then handle the prompt normally in the current conversation.
+- **Five minutes of silence:** Claim the expiry and transfer exactly once. Publish the prepared handoff, create and start the new conversation, report its destination thread, explain that creation does not automatically focus it in the UI, and treat the old conversation as superseded so no duplicate work resumes there.
+```
+
+**Manual PASS evidence:** The response implements all four branches exactly and treats the old conversation as superseded after either confirmed or timed transfer, so a late old-thread message cannot resume duplicate work.
+
+## GREEN result
+
+The candidate Skill passes all three original behavioral scenarios (3/3) on the first fresh evaluation run. No GREEN response exposed a new rationalization or loophole, so the candidate required no refactor.
