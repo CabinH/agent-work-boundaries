@@ -508,11 +508,11 @@ class StateStore:
 
     def _locked(self, pending_id: str):
         self._validate_pending_id(pending_id)
-        return _RecordLock(self.locks_dir / f"{pending_id}.lock")
+        return _RecordLock(self.locks_dir / f"pending-{pending_id}.lock")
 
     def _session_locked(self, session_id: str):
         lock_id = uuid.uuid5(uuid.NAMESPACE_URL, f"project-handoff:{session_id}")
-        return _RecordLock(self.locks_dir / f"{lock_id}.lock")
+        return _RecordLock(self.locks_dir / f"session-{lock_id}.lock")
 
     def _authority_locked(self, session_id: str):
         lock_id = uuid.uuid5(
@@ -677,7 +677,7 @@ class StateStore:
         return sequence
 
     def _prepare_sequence_locked(self):
-        return _RecordLock(self.locks_dir / "prepare-sequence.lock")
+        return _RecordLock(self.locks_dir / "prepare-sequence-global.lock")
 
     def _advance_prompt_fence(
         self,

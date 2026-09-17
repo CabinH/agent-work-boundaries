@@ -1,11 +1,14 @@
 import hashlib
 import json
+import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+import uuid
 
 
 SCRIPTS_DIR = (
@@ -60,6 +63,172 @@ class StateStoreTests(unittest.TestCase):
         self.assertTrue(all(not thread.is_alive() for thread in threads))
         self.assertEqual(errors, [])
         return results
+
+    def run_lock_collision_subprocess(self, operation):
+        script = r"""
+import sys
+import tempfile
+import uuid
+from pathlib import Path
+
+from state_store import StateStore
+
+operation = sys.argv[1]
+session_id = "thr-lock-namespace-collision"
+pending_id = str(
+    uuid.uuid5(uuid.NAMESPACE_URL, f"project-handoff:{session_id}")
+)
+initial_states = {
+    "status": "armed",
+    "arm": "draft",
+    "respond": "armed",
+    "claim_confirm": "armed",
+    "claim_expired": "armed",
+    "cancel": "armed",
+    "record_compaction": "armed",
+    "mark_thread_starting": "transferring",
+    "mark_thread_created": "thread_starting",
+    "mark_turn_starting": "thread_created",
+    "mark_transferred": "turn_starting",
+    "mark_indeterminate": "thread_starting",
+    "mark_thread_unsent_failed": "thread_starting",
+    "mark_turn_unsent": "turn_starting",
+    "mark_failed": "transferring",
+}
+
+with tempfile.TemporaryDirectory() as temporary:
+    store = StateStore(Path(temporary), now=lambda: 400.0)
+    record = {
+        "pending_id": pending_id,
+        "prepare_sequence": 1,
+        "state": initial_states[operation],
+        "cwd": "/repo",
+        "handoff_text": "handoff",
+        "target_path": "/repo/AI-HANDOFF.md",
+        "created_at": 100.0,
+    }
+    if operation != "arm":
+        record.update(
+            session_id=session_id,
+            generation=1,
+            deadline_at=400.0,
+        )
+    if operation in {"mark_transferred", "mark_turn_unsent"}:
+        record["new_thread_id"] = "thr-new"
+    store._write_record(store._pending_path(pending_id), record)
+    if operation != "status":
+        store._write_record(store._session_path(session_id), record)
+
+    actions = {
+        "status": lambda: store.get_session_status(session_id),
+        "arm": lambda: store.arm(pending_id, session_id, 300),
+        "respond": lambda: store.respond(session_id),
+        "claim_confirm": lambda: store.claim_confirm(pending_id),
+        "claim_expired": lambda: store.claim_expired(pending_id),
+        "cancel": lambda: store.cancel(pending_id),
+        "record_compaction": lambda: store.record_compaction(session_id, "auto"),
+        "mark_thread_starting": lambda: store.mark_thread_starting(
+            pending_id,
+            "recover",
+        ),
+        "mark_thread_created": lambda: store.mark_thread_created(
+            pending_id,
+            "thr-new",
+        ),
+        "mark_turn_starting": lambda: store.mark_turn_starting(
+            pending_id,
+            f"project-handoff:{pending_id}",
+        ),
+        "mark_transferred": lambda: store.mark_transferred(
+            pending_id,
+            "thr-new",
+        ),
+        "mark_indeterminate": lambda: store.mark_indeterminate(
+            pending_id,
+            "ambiguous",
+            "recover",
+        ),
+        "mark_thread_unsent_failed": lambda: store.mark_thread_unsent_failed(
+            pending_id,
+            "unsent",
+            "recover",
+        ),
+        "mark_turn_unsent": lambda: store.mark_turn_unsent(
+            pending_id,
+            "unsent",
+            "recover",
+        ),
+        "mark_failed": lambda: store.mark_failed(
+            pending_id,
+            "failed",
+            "recover",
+        ),
+    }
+    result = actions[operation]()
+    if result is None:
+        raise AssertionError(f"{operation} unexpectedly returned None")
+"""
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(SCRIPTS_DIR)
+        return subprocess.run(
+            [sys.executable, "-c", script, operation],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=1,
+            check=False,
+        )
+
+    def test_lock_namespaces_are_disjoint_for_adversarial_uuid_pairs(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+        session_id = "thr-lock-namespace-collision"
+        session_digest = str(
+            uuid.uuid5(uuid.NAMESPACE_URL, f"project-handoff:{session_id}")
+        )
+        authority_digest = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"project-handoff-authority:{session_id}",
+            )
+        )
+
+        for pending_id in (session_digest, authority_digest):
+            with self.subTest(pending_id=pending_id):
+                locks = (
+                    store._locked(pending_id),
+                    store._session_locked(session_id),
+                    store._authority_locked(session_id),
+                    store._prepare_sequence_locked(),
+                )
+                self.assertEqual(len({lock.path for lock in locks}), 4)
+                for lock in locks:
+                    with lock:
+                        pass
+                    self.assertEqual(stat.S_IMODE(lock.path.stat().st_mode), 0o600)
+
+    def test_adversarial_uuid_cannot_deadlock_session_bound_paths(self):
+        operations = (
+            "status",
+            "arm",
+            "respond",
+            "claim_confirm",
+            "claim_expired",
+            "cancel",
+            "record_compaction",
+            "mark_thread_starting",
+            "mark_thread_created",
+            "mark_turn_starting",
+            "mark_transferred",
+            "mark_indeterminate",
+            "mark_thread_unsent_failed",
+            "mark_turn_unsent",
+            "mark_failed",
+        )
+
+        for operation in operations:
+            with self.subTest(operation=operation):
+                completed = self.run_lock_collision_subprocess(operation)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_prepare_then_arm_binds_session_and_deadline(self):
         store = StateStore(self.root, now=lambda: 100.0)
