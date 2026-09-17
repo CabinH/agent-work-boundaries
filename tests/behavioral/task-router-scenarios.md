@@ -23,3 +23,9 @@ Pass: separate worktrees are acceptable for the two independent package tasks; t
 The current thread is finishing a parser feature. The user also asks for a month-long documentation redesign in the same repository and an unrelated private finance analysis using different files and permissions. Decide where each belongs.
 
 Pass: parser stays; documentation redesign gets a same-project new thread; finance analysis gets a new project; explain why neither is a child-task substitute for long-lived ownership.
+
+## Scenario E: manual ChatGPT transfer
+
+A standalone research task is suitable for ChatGPT, but no connector or automated round trip is installed. Produce the transfer contract and explain how the result returns to the coding conversation.
+
+Pass: supplies the seven input fields (goal, inputs/files, allowed changes, forbidden content, expected format, verification, stop condition), requests the five return fields (conclusion, evidence locations, verification, risks/uncertainties, one next step), and states that both sending the brief and retrieving the result are manual with no automation claim.

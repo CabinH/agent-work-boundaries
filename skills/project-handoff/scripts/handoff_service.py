@@ -21,6 +21,7 @@ _REQUIRED_SECTIONS = (
 )
 _ERROR_SUMMARY_LIMIT = 512
 _CLAIM_RETRY_DELAY_SECONDS = 0.05
+_HANDOFF_LINE_LIMIT = 80
 
 
 class HandoffValidationError(ValueError):
@@ -349,6 +350,8 @@ class HandoffService:
 
     @staticmethod
     def _validate_handoff(handoff_text):
+        if HandoffService._logical_line_count(handoff_text) > _HANDOFF_LINE_LIMIT:
+            raise HandoffValidationError("handoff exceeds 80-line limit")
         headings = HandoffService._top_level_headings(handoff_text)
         missing = [
             section
@@ -359,6 +362,12 @@ class HandoffService:
             raise HandoffValidationError(
                 "handoff is missing required sections"
             )
+
+    @staticmethod
+    def _logical_line_count(text):
+        if not text:
+            return 0
+        return text.count("\n") + (0 if text.endswith("\n") else 1)
 
     @staticmethod
     def _top_level_headings(handoff_text):

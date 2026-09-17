@@ -33,6 +33,19 @@ The four handlers are `Stop`, `UserPromptSubmit`, `PostCompact`, and
 compaction tracking are inactive. Explicit manual confirmation through
 `handoffctl.py confirm` remains available.
 
+Handoff drafts are limited to 80 logical lines. One terminal newline closes
+the final content line; an additional trailing blank line counts as another
+line. A transfer has one durable local claimant and at most one automatic send
+attempt per external phase. This does not promise external exactly-once
+creation: possibly sent requests stop for inspection and are not retried.
+
+The Task Router's ChatGPT route is manual in version 1. Its template carries
+goal, inputs/files, allowed changes, forbidden content, expected format,
+verification, and stop condition; it requests conclusion, evidence locations,
+verification, risks/uncertainties, and one next step. The user manually sends
+the brief and manually copies the result back. No web, connector, or result
+retrieval automation is claimed.
+
 Install and uninstall are serialized by a private, persistent bundle lock. If
 another bundle operation is already running, the competing command exits
 without changing either Skill or `hooks.json`; retry it after the first command
@@ -68,6 +81,23 @@ the angle-bracket token is user-supplied command syntax, not an implementation
 field. On transfer, App Server creates and starts the new thread, but the
 current Codex UI may not focus it automatically. Use the reported thread ID to
 open it when necessary.
+
+Recovery depends on the reported state:
+
+- `failed` is retryable only because no external request may have been sent;
+  after explicit approval, `confirm` retries the full transfer.
+- `thread_created` has a durable destination; after explicit approval,
+  `confirm` starts only the missing turn in that existing thread.
+- `thread_starting`, `turn_starting`, and `indeterminate` may have external
+  effects. Do not run `confirm` or retry them; inspect App Server/UI state and
+  the recovery fields while the old thread remains blocked.
+- `transferred` reports the destination in `new_thread_id`; open it and do not
+  resume duplicate work in the old conversation.
+
+The local Codex App Server daemon has a finite startup timeout. A daemon
+failure can therefore produce `failed` before any send, while a lost response
+after a possible send produces a blocked inspection state. UI focus is not a
+success signal; rely on durable status and the reported destination.
 
 ## Uninstall and restore
 

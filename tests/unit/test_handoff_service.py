@@ -16,7 +16,11 @@ SCRIPTS_DIR = (
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from app_server_client import AppServerError
-from handoff_service import HandoffService, PublicationRollbackError
+from handoff_service import (
+    HandoffService,
+    HandoffValidationError,
+    PublicationRollbackError,
+)
 from state_store import StateStore
 
 
@@ -29,6 +33,24 @@ Unit tests passed.
 # Next Step
 Add the integration fixture.
 """
+
+
+def handoff_with_line_count(line_count):
+    required_lines = [
+        "# Completed Work",
+        "Implemented the parser.",
+        "# Agreed Rules and Decisions",
+        "Keep the public API stable.",
+        "# Verification Status",
+        "Unit tests passed.",
+        "# Next Step",
+        "Add the integration fixture.",
+    ]
+    fillers = [
+        f"Completed detail {index}."
+        for index in range(line_count - len(required_lines))
+    ]
+    return "\n".join(required_lines[:2] + fillers + required_lines[2:]) + "\n"
 
 
 class RecordingClient:
@@ -239,6 +261,31 @@ class HandoffServiceTests(unittest.TestCase):
         pending_id = service.prepare(self.root, VALID_HANDOFF, target)
         service.arm(pending_id, session_id="thr-old", timeout_seconds=300)
         return pending_id, target
+
+    def test_prepare_accepts_exactly_80_lines_with_terminal_newline(self):
+        service, _client, _clock = self.make_service()
+
+        pending_id = service.prepare(
+            self.root,
+            handoff_with_line_count(80),
+            self.root / "docs" / "AI-HANDOFF.md",
+        )
+
+        self.assertIsNotNone(pending_id)
+
+    def test_prepare_rejects_81st_trailing_blank_line_with_safe_error(self):
+        service, _client, _clock = self.make_service()
+        draft = handoff_with_line_count(80) + "\n"
+
+        with self.assertRaisesRegex(
+            HandoffValidationError,
+            r"^handoff exceeds 80-line limit$",
+        ):
+            service.prepare(
+                self.root,
+                draft,
+                self.root / "docs" / "AI-HANDOFF.md",
+            )
 
     def test_confirm_publishes_then_launches_once(self):
         client = RecordingClient()

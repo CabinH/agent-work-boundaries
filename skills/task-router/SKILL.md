@@ -46,6 +46,24 @@ Bring back only:
 
 Do not return complete logs or large raw source dumps.
 
+## Manual ChatGPT Transfer Template
+
+Sending this brief and retrieving its result are manual; version 1 claims no ChatGPT web, connector, or result-retrieval automation.
+
+```text
+目标：
+输入与相关文件：
+允许修改的范围：
+不可触碰的内容：
+期望返回格式：
+验证要求：
+停止条件：
+
+仅返回：1. 结论；2. 关键证据及位置；3. 验证结果；4. 风险与不确定项；5. 建议的下一步。
+```
+
+Manually paste the completed template into ChatGPT. When it finishes, manually copy the five-field result back to the main Agent for judgment and integration.
+
 ## Do Not Delegate
 
 Keep work in the main thread when it contains a user decision, ambiguous scope, a need for new authorization, an irreversible external mutation, or writes overlapping another active worker. Stop and escalate instead of guessing or silently expanding authority. Parallel writers must have disjoint file ownership; serialize shared-file changes under one owner.
