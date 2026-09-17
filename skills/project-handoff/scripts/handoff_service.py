@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import secrets
 import stat
+import sys
 import tempfile
 import time
 
@@ -301,14 +302,28 @@ class HandoffService:
                     ) from rollback_error
                 raise
         finally:
+            primary_error = sys.exc_info()[1]
+            cleanup_error = None
             if temporary_name is not None:
                 try:
                     os.unlink(temporary_name, dir_fd=parent_fd)
                 except FileNotFoundError:
                     pass
+                except OSError as error:
+                    cleanup_error = error
             if published_fd is not None:
-                os.close(published_fd)
-            os.close(parent_fd)
+                try:
+                    os.close(published_fd)
+                except OSError as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+            try:
+                os.close(parent_fd)
+            except OSError as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+            if primary_error is None and cleanup_error is not None:
+                raise cleanup_error
 
     @staticmethod
     def _verify_project_parent(cwd, parent_parts, parent_fd):

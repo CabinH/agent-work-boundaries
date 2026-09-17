@@ -16,7 +16,7 @@ SCRIPTS_DIR = (
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from app_server_client import LaunchResult
-from handoff_service import HandoffService
+from handoff_service import HandoffService, PublicationRollbackError
 from state_store import StateStore
 
 
@@ -677,6 +677,228 @@ class HandoffServiceTests(unittest.TestCase):
             self.assertEqual(private_copy.read_text(), VALID_HANDOFF)
             self.assertTrue((displaced / target.name).exists())
             self.assertEqual(client.calls, [])
+
+    def test_cleanup_failure_cannot_mask_exact_inode_sanitization_failure(self):
+        service, client, _clock = self.make_service()
+        target = self.root / "docs" / "AI-HANDOFF.md"
+        pending_id = service.prepare(self.root, VALID_HANDOFF, target)
+        service.arm(pending_id, "thr-old", 300)
+        target.parent.mkdir()
+        real_replace = os.replace
+        real_close = os.close
+
+        with tempfile.TemporaryDirectory() as outside_name:
+            displaced = Path(outside_name) / "displaced-docs"
+            moved = False
+            retained_fd = None
+
+            def move_parent_outside(source, destination, *args, **kwargs):
+                nonlocal moved
+                is_project_publish = (
+                    destination == target.name and "dst_dir_fd" in kwargs
+                )
+                if not moved and is_project_publish:
+                    moved = True
+                    target.parent.rename(displaced)
+                return real_replace(source, destination, *args, **kwargs)
+
+            def fail_sanitization(descriptor, _length):
+                nonlocal retained_fd
+                retained_fd = descriptor
+                raise OSError("sanitize denied")
+
+            def fail_retained_close(descriptor):
+                real_close(descriptor)
+                if descriptor == retained_fd:
+                    raise OSError("retained close denied")
+
+            with mock.patch(
+                "handoff_service.os.replace",
+                side_effect=move_parent_outside,
+            ), mock.patch(
+                "handoff_service.os.ftruncate",
+                side_effect=fail_sanitization,
+            ), mock.patch(
+                "handoff_service.os.close",
+                side_effect=fail_retained_close,
+            ):
+                with self.assertRaises(PublicationRollbackError) as caught:
+                    service.confirm(pending_id)
+
+            private_copy = self.root / "private" / f"{pending_id}.md"
+            self.assertEqual(
+                str(caught.exception),
+                "unable to roll back unsafe project publication",
+            )
+            self.assertEqual(service.status("thr-old")["state"], "failed")
+            self.assertEqual(private_copy.read_text(), VALID_HANDOFF)
+            self.assertEqual(client.calls, [])
+
+    def test_project_publish_attempts_all_cleanup_after_earlier_failures(self):
+        target = self.root / "docs" / "AI-HANDOFF.md"
+        target.parent.mkdir()
+        real_create_temp = HandoffService._create_temp_at
+        real_open_parent = HandoffService._open_project_parent
+        real_unlink = os.unlink
+        real_close = os.close
+        retained_fd = None
+        parent_fd = None
+        temporary_name = None
+        cleanup_attempts = []
+
+        def record_parent(*args, **kwargs):
+            nonlocal parent_fd
+            parent_fd = real_open_parent(*args, **kwargs)
+            return parent_fd
+
+        def record_temp(descriptor):
+            nonlocal temporary_name, retained_fd
+            temporary_name, retained_fd = real_create_temp(descriptor)
+            return temporary_name, retained_fd
+
+        def fail_write_fsync(_descriptor):
+            raise OSError("write fsync failed")
+
+        def fail_temp_unlink(name, *args, **kwargs):
+            if name == temporary_name and "dir_fd" in kwargs:
+                cleanup_attempts.append("unlink")
+                raise OSError("temp unlink failed")
+            return real_unlink(name, *args, **kwargs)
+
+        def close_and_record(descriptor):
+            if descriptor == retained_fd:
+                cleanup_attempts.append("retained close")
+                real_close(descriptor)
+                raise OSError("retained close failed")
+            if descriptor == parent_fd:
+                cleanup_attempts.append("parent close")
+            return real_close(descriptor)
+
+        caught = None
+        try:
+            with mock.patch.object(
+                HandoffService,
+                "_open_project_parent",
+                side_effect=record_parent,
+            ), mock.patch.object(
+                HandoffService,
+                "_create_temp_at",
+                side_effect=record_temp,
+            ), mock.patch(
+                "handoff_service.os.fsync",
+                side_effect=fail_write_fsync,
+            ), mock.patch(
+                "handoff_service.os.unlink",
+                side_effect=fail_temp_unlink,
+            ), mock.patch(
+                "handoff_service.os.close",
+                side_effect=close_and_record,
+            ):
+                try:
+                    HandoffService._publish_project(
+                        self.root,
+                        target,
+                        VALID_HANDOFF,
+                    )
+                except OSError as error:
+                    caught = error
+
+            self.assertIsNotNone(caught)
+            self.assertEqual(str(caught), "write fsync failed")
+            self.assertEqual(
+                cleanup_attempts,
+                ["unlink", "retained close", "parent close"],
+            )
+            for descriptor in (retained_fd, parent_fd):
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+        finally:
+            for descriptor in (retained_fd, parent_fd):
+                if descriptor is None:
+                    continue
+                try:
+                    os.fstat(descriptor)
+                except OSError:
+                    continue
+                real_close(descriptor)
+            if temporary_name is not None:
+                (target.parent / temporary_name).unlink(missing_ok=True)
+
+    def test_project_publish_surfaces_cleanup_error_after_all_closes(self):
+        target = self.root / "docs" / "AI-HANDOFF.md"
+        target.parent.mkdir()
+        real_create_temp = HandoffService._create_temp_at
+        real_open_parent = HandoffService._open_project_parent
+        real_close = os.close
+        retained_fd = None
+        parent_fd = None
+        parent_open_count = 0
+        cleanup_attempts = []
+
+        def record_parent(*args, **kwargs):
+            nonlocal parent_fd, parent_open_count
+            descriptor = real_open_parent(*args, **kwargs)
+            parent_open_count += 1
+            if parent_open_count == 1:
+                parent_fd = descriptor
+            return descriptor
+
+        def record_temp(descriptor):
+            nonlocal retained_fd
+            name, retained_fd = real_create_temp(descriptor)
+            return name, retained_fd
+
+        def close_and_fail_retained(descriptor):
+            if descriptor == retained_fd:
+                cleanup_attempts.append("retained close")
+                real_close(descriptor)
+                raise OSError("retained close failed")
+            if descriptor == parent_fd:
+                cleanup_attempts.append("parent close")
+            return real_close(descriptor)
+
+        caught = None
+        try:
+            with mock.patch.object(
+                HandoffService,
+                "_open_project_parent",
+                side_effect=record_parent,
+            ), mock.patch.object(
+                HandoffService,
+                "_create_temp_at",
+                side_effect=record_temp,
+            ), mock.patch(
+                "handoff_service.os.close",
+                side_effect=close_and_fail_retained,
+            ):
+                try:
+                    HandoffService._publish_project(
+                        self.root,
+                        target,
+                        VALID_HANDOFF,
+                    )
+                except OSError as error:
+                    caught = error
+
+            self.assertIsNotNone(caught)
+            self.assertEqual(str(caught), "retained close failed")
+            self.assertEqual(
+                cleanup_attempts,
+                ["retained close", "parent close"],
+            )
+            self.assertEqual(target.read_text(), VALID_HANDOFF)
+            for descriptor in (retained_fd, parent_fd):
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+        finally:
+            for descriptor in (retained_fd, parent_fd):
+                if descriptor is None:
+                    continue
+                try:
+                    os.fstat(descriptor)
+                except OSError:
+                    continue
+                real_close(descriptor)
 
     def test_displaced_rollback_never_deletes_swapped_unrelated_file(self):
         service, client, _clock = self.make_service()
