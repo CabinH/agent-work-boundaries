@@ -19,6 +19,10 @@ import handoff_hook
 
 
 PENDING_ID = "123e4567-e89b-42d3-a456-426614174000"
+QUOTED_PYTHON = "/opt/Codex Python/bin/python3"
+QUOTED_HANDOFFCTL = Path(
+    "/installed/project handoff/scripts/handoffctl.py"
+)
 
 
 class FakeStore:
@@ -39,6 +43,7 @@ class FakeService:
         self.records = dict(records or {})
         self.arm_calls = []
         self.respond_calls = []
+        self.cancel_calls = []
         self.status_calls = []
         self.store = FakeStore()
 
@@ -62,6 +67,18 @@ class FakeService:
         responded = dict(record, state="responded")
         self.records[session_id] = responded
         return responded
+
+    def cancel(self, pending_id):
+        self.cancel_calls.append(pending_id)
+        for session_id, record in self.records.items():
+            if record.get("pending_id") != pending_id:
+                continue
+            if record.get("state") not in {"armed", "responded", "failed"}:
+                return None
+            cancelled = dict(record, state="cancelled")
+            self.records[session_id] = cancelled
+            return cancelled
+        return None
 
     def status(self, session_id):
         self.status_calls.append(session_id)
@@ -93,6 +110,12 @@ class RecordingSpawner:
     def __call__(self, argv, **options):
         self.calls.append((list(argv), dict(options)))
         return object()
+
+
+class FailingSpawner(RecordingSpawner):
+    def __call__(self, argv, **options):
+        self.calls.append((list(argv), dict(options)))
+        raise RuntimeError("Bearer private-worker-token")
 
 
 def stop_event(message):
@@ -254,15 +277,56 @@ class HandoffHookStopAndPromptTests(unittest.TestCase):
                 )
                 self.assertIn("countdown was cancelled", context)
                 self.assertIn(
-                    f"handoffctl confirm --pending-id {PENDING_ID}",
+                    f"confirm --pending-id {PENDING_ID}",
                     context,
                 )
                 self.assertIn(
-                    f"handoffctl cancel --pending-id {PENDING_ID}",
+                    f"cancel --pending-id {PENDING_ID}",
                     context,
                 )
                 self.assertIn("otherwise continue here", context)
                 self.assertLess(len(context.split()), 120)
+
+    def test_user_prompt_guidance_uses_copyable_installed_commands(self):
+        service = FakeService(
+            {
+                "thr-old": {
+                    "pending_id": PENDING_ID,
+                    "session_id": "thr-old",
+                    "state": "armed",
+                }
+            }
+        )
+
+        with mock.patch.object(
+            handoff_hook,
+            "HANDOFFCTL_PATH",
+            QUOTED_HANDOFFCTL,
+        ), mock.patch.object(
+            handoff_hook.sys,
+            "executable",
+            QUOTED_PYTHON,
+        ):
+            result = handoff_hook.handle_event(
+                prompt_event(),
+                service,
+                RecordingSpawner(),
+            )
+
+        context = result["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(
+            "'/opt/Codex Python/bin/python3' "
+            "'/installed/project handoff/scripts/handoffctl.py' "
+            f"confirm --pending-id {PENDING_ID}",
+            context,
+        )
+        self.assertIn(
+            "'/opt/Codex Python/bin/python3' "
+            "'/installed/project handoff/scripts/handoffctl.py' "
+            f"cancel --pending-id {PENDING_ID}",
+            context,
+        )
+        self.assertNotIn("run handoffctl", context)
 
     def test_user_prompt_blocks_superseded_session(self):
         service = FakeService(
@@ -293,6 +357,161 @@ class HandoffHookStopAndPromptTests(unittest.TestCase):
             },
         )
         self.assertEqual(service.respond_calls, [])
+
+    def test_user_prompt_blocks_transferred_session_without_destination(self):
+        service = FakeService(
+            {
+                "thr-old": {
+                    "pending_id": PENDING_ID,
+                    "session_id": "thr-old",
+                    "state": "transferred",
+                }
+            }
+        )
+
+        result = handoff_hook.handle_event(
+            prompt_event(),
+            service,
+            RecordingSpawner(),
+        )
+
+        self.assertEqual(result["decision"], "block")
+        self.assertIn("do not continue duplicate work", result["reason"])
+        self.assertIn("status", result["reason"])
+        self.assertEqual(service.respond_calls, [])
+
+    def test_user_prompt_blocks_transfer_in_progress_without_destination(self):
+        for state in ("transferring", "expired"):
+            with self.subTest(state=state):
+                service = FakeService(
+                    {
+                        "thr-old": {
+                            "pending_id": PENDING_ID,
+                            "session_id": "thr-old",
+                            "state": state,
+                        }
+                    }
+                )
+
+                result = handoff_hook.handle_event(
+                    prompt_event(),
+                    service,
+                    RecordingSpawner(),
+                )
+
+                self.assertEqual(result["decision"], "block")
+                self.assertIn("do not continue duplicate work", result["reason"])
+                self.assertIn("status", result["reason"])
+                self.assertEqual(service.respond_calls, [])
+
+    def test_in_progress_block_uses_copyable_installed_status_command(self):
+        service = FakeService(
+            {
+                "thr-old": {
+                    "pending_id": PENDING_ID,
+                    "session_id": "thr-old",
+                    "state": "transferring",
+                }
+            }
+        )
+
+        with mock.patch.object(
+            handoff_hook,
+            "HANDOFFCTL_PATH",
+            QUOTED_HANDOFFCTL,
+        ), mock.patch.object(
+            handoff_hook.sys,
+            "executable",
+            QUOTED_PYTHON,
+        ):
+            result = handoff_hook.handle_event(
+                prompt_event(),
+                service,
+                RecordingSpawner(),
+            )
+
+        self.assertIn(
+            "'/opt/Codex Python/bin/python3' "
+            "'/installed/project handoff/scripts/handoffctl.py' "
+            "status --session-id thr-old",
+            result["reason"],
+        )
+        self.assertNotIn("run handoffctl", result["reason"])
+
+    def test_user_prompt_blocks_when_armed_response_loses_expiry_race(self):
+        class OverdueArmedService(FakeService):
+            def respond(self, session_id):
+                self.respond_calls.append(session_id)
+                return None
+
+        service = OverdueArmedService(
+            {
+                "thr-old": {
+                    "pending_id": PENDING_ID,
+                    "session_id": "thr-old",
+                    "state": "armed",
+                }
+            }
+        )
+
+        result = handoff_hook.handle_event(
+            prompt_event(),
+            service,
+            RecordingSpawner(),
+        )
+
+        self.assertEqual(result["decision"], "block")
+        self.assertIn("do not continue duplicate work", result["reason"])
+        self.assertIn("status", result["reason"])
+        self.assertEqual(service.respond_calls, ["thr-old"])
+
+    def test_user_prompt_race_reports_destination_when_transfer_finishes(self):
+        class FinishedRaceService(FakeService):
+            def __init__(self):
+                super().__init__()
+                self.statuses = iter(
+                    (
+                        {
+                            "pending_id": PENDING_ID,
+                            "session_id": "thr-old",
+                            "state": "armed",
+                        },
+                        {
+                            "pending_id": PENDING_ID,
+                            "session_id": "thr-old",
+                            "state": "transferred",
+                            "new_thread_id": "thr-new",
+                        },
+                    )
+                )
+
+            def status(self, session_id):
+                self.status_calls.append(session_id)
+                return next(self.statuses)
+
+            def respond(self, session_id):
+                self.respond_calls.append(session_id)
+                return None
+
+        service = FinishedRaceService()
+
+        result = handoff_hook.handle_event(
+            prompt_event(),
+            service,
+            RecordingSpawner(),
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "decision": "block",
+                "reason": (
+                    "This conversation was handed off to thread thr-new; "
+                    "open that thread instead of continuing duplicate work."
+                ),
+            },
+        )
+        self.assertEqual(service.respond_calls, ["thr-old"])
 
     def test_late_prompts_do_not_reopen_responded_or_cancelled_handoffs(self):
         for state in ("responded", "cancelled"):
@@ -511,18 +730,30 @@ class HandoffHookCompactionTests(unittest.TestCase):
             }
         )
 
-        result = handoff_hook.handle_event(
-            session_start_event("resume"),
-            service,
-            RecordingSpawner(),
-        )
+        with mock.patch.object(
+            handoff_hook,
+            "HANDOFFCTL_PATH",
+            QUOTED_HANDOFFCTL,
+        ), mock.patch.object(
+            handoff_hook.sys,
+            "executable",
+            QUOTED_PYTHON,
+        ):
+            result = handoff_hook.handle_event(
+                session_start_event("resume"),
+                service,
+                RecordingSpawner(),
+            )
 
         context = self.context_from(result)
         self.assertIn("handoff transfer failed", context)
         self.assertIn(
-            "handoffctl status --session-id thr-old",
+            "'/opt/Codex Python/bin/python3' "
+            "'/installed/project handoff/scripts/handoffctl.py' "
+            "status --session-id thr-old",
             context,
         )
+        self.assertNotIn("run handoffctl", context)
 
     def test_failed_recovery_and_compaction_context_stays_below_word_limit(self):
         service = FakeService(
@@ -547,12 +778,132 @@ class HandoffHookCompactionTests(unittest.TestCase):
         self.assertIn("handoff transfer failed", context)
         self.assertIn("strongly request a project handoff", context)
         self.assertIn(
-            "handoffctl status --session-id thr-old",
+            "status --session-id thr-old",
             context,
         )
 
+    def test_pathological_session_id_uses_short_safe_recovery_fallback(self):
+        session_id = "session-part " * 150
+        service = FakeService(
+            {
+                session_id: {
+                    "pending_id": PENDING_ID,
+                    "session_id": session_id,
+                    "state": "failed",
+                    "recovery_prompt": "resume " * 150,
+                }
+            }
+        )
+
+        result = handoff_hook.handle_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": session_id,
+                "source": "resume",
+            },
+            service,
+            RecordingSpawner(),
+        )
+
+        context = result["hookSpecificOutput"]["additionalContext"]
+        self.assertLess(len(context.split()), 120)
+        self.assertIn("handoff transfer failed", context)
+        self.assertIn("too long to embed safely", context)
+        self.assertNotIn("--session-id", context)
+
 
 class HandoffHookSafetyAndMainTests(unittest.TestCase):
+    def test_main_spawn_failure_disables_timer_and_returns_warning(self):
+        service = FakeService()
+        marker = f"<!-- project-handoff:pending={PENDING_ID} -->"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with mock.patch.object(
+            handoff_hook,
+            "HANDOFFCTL_PATH",
+            QUOTED_HANDOFFCTL,
+        ), mock.patch.object(
+            handoff_hook.sys,
+            "executable",
+            QUOTED_PYTHON,
+        ):
+            code = handoff_hook.main(
+                stdin=io.StringIO(json.dumps(stop_event(marker))),
+                stdout=stdout,
+                stderr=stderr,
+                service=service,
+                spawn_worker=FailingSpawner(),
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(service.records["thr-old"]["state"], "responded")
+        lines = stdout.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        result = json.loads(lines[0])
+        warning = result["systemMessage"]
+        self.assertIn("timer did not start", warning)
+        self.assertIn("confirm", warning)
+        self.assertIn("cancel", warning)
+        self.assertIn(PENDING_ID, warning)
+        self.assertIn(
+            "'/opt/Codex Python/bin/python3' "
+            "'/installed/project handoff/scripts/handoffctl.py' "
+            f"confirm --pending-id {PENDING_ID}",
+            warning,
+        )
+        self.assertIn(
+            "'/opt/Codex Python/bin/python3' "
+            "'/installed/project handoff/scripts/handoffctl.py' "
+            f"cancel --pending-id {PENDING_ID}",
+            warning,
+        )
+        self.assertNotIn("run handoffctl", warning)
+        self.assertNotIn("private-worker-token", warning)
+        self.assertLess(len(warning.split()), 120)
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_spawn_failure_cancels_when_response_cannot_disable_timer(self):
+        class CannotRespondService(FakeService):
+            def respond(self, session_id):
+                self.respond_calls.append(session_id)
+                return None
+
+        service = CannotRespondService()
+        marker = f"<!-- project-handoff:pending={PENDING_ID} -->"
+        stdout = io.StringIO()
+
+        with mock.patch.object(
+            handoff_hook,
+            "HANDOFFCTL_PATH",
+            QUOTED_HANDOFFCTL,
+        ), mock.patch.object(
+            handoff_hook.sys,
+            "executable",
+            QUOTED_PYTHON,
+        ):
+            code = handoff_hook.main(
+                stdin=io.StringIO(json.dumps(stop_event(marker))),
+                stdout=stdout,
+                stderr=io.StringIO(),
+                service=service,
+                spawn_worker=FailingSpawner(),
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(service.records["thr-old"]["state"], "cancelled")
+        self.assertEqual(service.cancel_calls, [PENDING_ID])
+        warning = json.loads(stdout.getvalue())["systemMessage"]
+        self.assertIn("automatic transfer was cancelled", warning)
+        self.assertIn(
+            "'/opt/Codex Python/bin/python3' "
+            "'/installed/project handoff/scripts/handoffctl.py' "
+            "status --session-id thr-old",
+            warning,
+        )
+        self.assertNotIn("private-worker-token", warning)
+        self.assertLess(len(warning.split()), 120)
+
     def test_malformed_and_unknown_events_have_no_effect(self):
         malformed = (
             None,

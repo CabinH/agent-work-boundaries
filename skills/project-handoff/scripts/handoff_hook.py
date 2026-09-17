@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 
@@ -52,20 +53,68 @@ def _handle_stop(payload, service, spawn_worker):
     armed = service.arm(pending_id, session_id, 300)
     if armed is None:
         return None
-    spawn_worker(
-        [
-            sys.executable,
-            str(HANDOFFCTL_PATH),
-            "wait",
-            "--pending-id",
-            pending_id,
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-    )
+    try:
+        spawn_worker(
+            [
+                sys.executable,
+                str(HANDOFFCTL_PATH),
+                "wait",
+                "--pending-id",
+                pending_id,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except Exception:
+        disabled = None
+        try:
+            disabled = service.respond(session_id)
+        except Exception:
+            pass
+        if disabled is None:
+            try:
+                disabled = service.cancel(pending_id)
+            except Exception:
+                pass
+        if isinstance(disabled, dict) and disabled.get("state") == "responded":
+            confirm_command = _control_command(
+                "confirm",
+                "--pending-id",
+                pending_id,
+            )
+            cancel_command = _control_command(
+                "cancel",
+                "--pending-id",
+                pending_id,
+            )
+            message = (
+                "The handoff timer did not start, so automatic transfer is "
+                "disabled. To transfer explicitly, run "
+                f"{confirm_command}; to remain here, run {cancel_command}."
+            )
+        else:
+            status_command = _control_command(
+                "status",
+                "--session-id",
+                session_id,
+            )
+            if (
+                isinstance(disabled, dict)
+                and disabled.get("state") == "cancelled"
+            ):
+                outcome = "automatic transfer was cancelled"
+            else:
+                outcome = "automatic transfer state needs review"
+            message = (
+                f"The handoff timer did not start and {outcome}. Run "
+                f"{status_command} for the current state and recovery details."
+            )
+        return {
+            "systemMessage": message
+        }
     return None
 
 
@@ -78,36 +127,52 @@ def _handle_user_prompt(payload, service):
         return None
 
     status = service.status(session_id)
-    terminal_output = _terminal_prompt_output(status)
+    terminal_output = _terminal_prompt_output(status, session_id)
     if terminal_output is not None:
         return terminal_output
 
     responded = service.respond(session_id)
     if responded is not None:
         pending_id = str(responded["pending_id"])
+        confirm_command = _control_command(
+            "confirm",
+            "--pending-id",
+            pending_id,
+        )
+        cancel_command = _control_command(
+            "cancel",
+            "--pending-id",
+            pending_id,
+        )
         return _additional_context(
             "UserPromptSubmit",
             (
                 "A pending handoff countdown was cancelled by this prompt. "
                 "If the user confirms, run "
-                f"handoffctl confirm --pending-id {pending_id}; "
+                f"{confirm_command}; "
                 "if the user rejects, run "
-                f"handoffctl cancel --pending-id {pending_id}; "
+                f"{cancel_command}; "
                 "otherwise continue here and do not transfer automatically."
             ),
         )
 
-    return _terminal_prompt_output(service.status(session_id))
+    status = service.status(session_id)
+    terminal_output = _terminal_prompt_output(status, session_id)
+    if terminal_output is not None:
+        return terminal_output
+    if isinstance(status, dict) and status.get("state") == "armed":
+        return _in_progress_block(session_id)
+    return None
 
 
-def _terminal_prompt_output(status):
+def _terminal_prompt_output(status, session_id):
     if not isinstance(status, dict):
         return None
     state = status.get("state")
     if state in {"transferred", "superseded"}:
         destination = status.get("new_thread_id")
         if not isinstance(destination, str) or not destination:
-            return None
+            return _in_progress_block(session_id)
         return {
             "decision": "block",
             "reason": (
@@ -123,7 +188,26 @@ def _terminal_prompt_output(status):
             "UserPromptSubmit",
             context,
         )
+    if state in {"transferring", "expired"}:
+        return _in_progress_block(session_id)
     return None
+
+
+def _in_progress_block(session_id):
+    status_command = _control_command(
+        "status",
+        "--session-id",
+        session_id,
+    )
+    return {
+        "decision": "block",
+        "reason": (
+            "This conversation has a handoff in progress; do not continue "
+            "duplicate work here. Run "
+            f"{status_command} to find the "
+            "destination or recovery instructions."
+        ),
+    }
 
 
 def _handle_post_compact(payload, service):
@@ -196,14 +280,39 @@ def _failed_recovery_context(status):
 def _failed_recovery_fallback(status):
     session_id = status.get("session_id")
     if isinstance(session_id, str) and session_id:
-        return (
+        status_command = _control_command(
+            "status",
+            "--session-id",
+            session_id,
+        )
+        context = (
             "The previous handoff transfer failed. Run "
-            f"handoffctl status --session-id {session_id} and use its full "
+            f"{status_command} and use its full "
             "recovery_prompt in /new."
         )
+        if len(context.split()) < 80:
+            return context
+        return (
+            "The previous handoff transfer failed, but its status command is "
+            "too long to embed safely. Open a new conversation and recover "
+            "from the saved project-handoff state rather than continuing here."
+        )
     return (
-        "The previous handoff transfer failed. Use handoffctl status for this "
-        "session and paste its full recovery_prompt into /new."
+        "The previous handoff transfer failed, but its session identifier is "
+        "unavailable. Open a new conversation and recover from the saved "
+        "project-handoff state rather than continuing here."
+    )
+
+
+def _control_command(subcommand, identifier_option, identifier):
+    return shlex.join(
+        [
+            sys.executable,
+            str(HANDOFFCTL_PATH),
+            subcommand,
+            identifier_option,
+            identifier,
+        ]
     )
 
 
