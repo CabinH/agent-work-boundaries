@@ -117,7 +117,7 @@ agent-work-boundaries/
   - 保存新 thread ID、执行状态和精简错误。
 - `hooks/handoff_hook.py`
   - 接收 Codex Hooks JSON 输入。
-  - 处理 `Stop`、`UserPromptSubmit`、`PostCompact` 等事件。
+  - 处理 `Stop`、`UserPromptSubmit`、`PostCompact`、`SessionStart` 等事件。
   - 只返回必要的附加上下文或阻止信息。
 
 ## 5. 确认与五分钟自动交接
@@ -207,8 +207,8 @@ armed -> expired -> transferring -> transferred
 
 - `Stop`：识别交接标记并启动非阻塞计时器。
 - `UserPromptSubmit`：取消待执行计时器；对已迁移 session 注入警告。
-- `PostCompact`：累计自动/手动压缩次数并按阈值增加上下文提醒。
-- 可选 `SessionStart`：检查未完成或失败的交接并给出恢复提示。
+- `PostCompact`：累计自动/手动压缩次数，并按阈值显示简短状态提示。
+- `SessionStart`：当 `source=compact` 时读取计数并注入模型上下文；在启动或恢复时检查未完成或失败的交接。
 
 Hooks 安装后需要用户通过 `/hooks` 审查并信任。未获信任时，Skill 明确退化为手动确认流程，不声称五分钟自动机制已生效。
 
