@@ -1,0 +1,7 @@
+interface:
+  display_name: "Task Router"
+  short_description: "Route work across threads, agents, and worktrees"
+  default_prompt: "Use $task-router to choose safe execution boundaries for this work."
+
+policy:
+  allow_implicit_invocation: true
