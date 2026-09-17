@@ -81,7 +81,7 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(json.loads(session_path.read_text()), armed)
         self.assertEqual(stat.S_IMODE(pending_path.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(session_path.stat().st_mode), 0o600)
-        for directory in ("pending", "sessions", "locks"):
+        for directory in ("pending", "sessions", "session-metadata", "locks"):
             self.assertEqual(
                 stat.S_IMODE((self.root / directory).stat().st_mode),
                 0o700,
@@ -354,117 +354,267 @@ class StateStoreTests(unittest.TestCase):
         self.assertNotIn("prompt_fences", persisted)
         self.assertLess(len(json.dumps(persisted)), 300)
 
-    def test_status_never_downgrades_cache_when_new_arm_wins_scan_race(self):
+    def test_status_and_new_arm_serialize_without_cache_downgrade(self):
         store = StateStore(self.root, now=lambda: 100.0)
         older = store.prepare("/repo", "older", "/repo/older.md")
-        store.arm(older["pending_id"], "thr-old", 300)
+        older_armed = store.arm(older["pending_id"], "thr-old", 300)
         newer = store.prepare("/repo", "newer", "/repo/newer.md")
         paused = threading.Event()
         resume = threading.Event()
-        original_session_locked = store._session_locked
+        arm_started = threading.Event()
+        arm_done = threading.Event()
+        original_authority_locked = store._authority_locked
 
-        class PausingSessionLock:
+        class PausingAuthorityLock:
             def __init__(self, inner):
                 self.inner = inner
 
             def __enter__(self):
+                entered = self.inner.__enter__()
                 paused.set()
                 if not resume.wait(timeout=5):
                     raise RuntimeError("status race barrier timed out")
-                return self.inner.__enter__()
+                return entered
 
             def __exit__(self, *args):
                 return self.inner.__exit__(*args)
 
-        def controlled_session_lock(session_id):
-            lock = original_session_locked(session_id)
+        def controlled_authority_lock(session_id):
+            lock = original_authority_locked(session_id)
             if threading.current_thread().name == "status-race":
-                return PausingSessionLock(lock)
+                return PausingAuthorityLock(lock)
             return lock
 
-        store._session_locked = controlled_session_lock
-        result = []
+        store._authority_locked = controlled_authority_lock
+        status_result = []
+        arm_result = []
         errors = []
 
         def lookup():
             try:
-                result.append(store.get_session_status("thr-old"))
+                status_result.append(store.get_session_status("thr-old"))
             except BaseException as error:
                 errors.append(error)
 
-        thread = threading.Thread(target=lookup, name="status-race")
-        thread.start()
-        self.assertTrue(paused.wait(timeout=5))
-        newer_armed = store.arm(newer["pending_id"], "thr-old", 300)
-        resume.set()
-        thread.join(timeout=5)
+        def arm():
+            try:
+                arm_started.set()
+                arm_result.append(store.arm(newer["pending_id"], "thr-old", 300))
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                arm_done.set()
 
-        self.assertFalse(thread.is_alive())
+        status_thread = threading.Thread(target=lookup, name="status-race")
+        status_thread.start()
+        self.assertTrue(paused.wait(timeout=5))
+        arm_thread = threading.Thread(target=arm, name="arm-race")
+        arm_thread.start()
+        self.assertTrue(arm_started.wait(timeout=5))
+        self.assertFalse(arm_done.wait(timeout=0.1))
+        resume.set()
+        status_thread.join(timeout=5)
+        arm_thread.join(timeout=5)
+
+        self.assertFalse(status_thread.is_alive())
+        self.assertFalse(arm_thread.is_alive())
         self.assertEqual(errors, [])
-        self.assertEqual(result[0]["pending_id"], newer["pending_id"])
-        self.assertEqual(result[0]["generation"], newer_armed["generation"])
+        self.assertEqual(status_result[0], older_armed)
+        self.assertEqual(arm_result[0]["generation"], 2)
         self.assertEqual(
             self.read_session("thr-old")["pending_id"],
             newer["pending_id"],
         )
 
-    def test_respond_retries_when_new_arm_wins_authority_window(self):
+    def test_stale_gen1_cache_cannot_authorize_old_expiry_over_durable_gen2(self):
+        clock = [100.0]
+        store = StateStore(self.root, now=lambda: clock[0])
+        store.record_compaction("thr-old", "auto")
+        fenced = store.respond("thr-old")
+        older = store.prepare("/repo", "older", "/repo/older.md")
+        older_armed = store.arm(older["pending_id"], "thr-old", 300)
+        newer = store.prepare("/repo", "newer", "/repo/newer.md")
+        newer_armed = store.arm(newer["pending_id"], "thr-old", 300)
+        session_name = hashlib.sha256(b"thr-old").hexdigest()
+        session_path = self.root / "sessions" / f"{session_name}.json"
+        session_path.write_text(json.dumps(older_armed))
+        clock[0] = 400.0
+
+        stale_claim = store.claim_expired(older["pending_id"])
+        rebuilt = store.get_session_status("thr-old")
+
+        self.assertIsNone(stale_claim)
+        self.assertEqual(
+            self.read_pending(older["pending_id"])["state"],
+            "cancelled",
+        )
+        self.assertEqual(rebuilt["pending_id"], newer["pending_id"])
+        self.assertEqual(rebuilt["generation"], newer_armed["generation"])
+        self.assertEqual(rebuilt["compaction_count"], 1)
+        self.assertEqual(rebuilt["compaction_sources"], {"auto": 1})
+        self.assertEqual(
+            rebuilt["prompt_fence_generation"],
+            fenced["prompt_fence_generation"],
+        )
+        self.assertEqual(self.read_session("thr-old"), rebuilt)
+
+    def test_missing_cache_cannot_authorize_old_confirm_over_durable_gen2(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+        store.record_compaction("thr-old", "manual")
+        fenced = store.respond("thr-old")
+        older = store.prepare("/repo", "older", "/repo/older.md")
+        store.arm(older["pending_id"], "thr-old", 300)
+        newer = store.prepare("/repo", "newer", "/repo/newer.md")
+        newer_armed = store.arm(newer["pending_id"], "thr-old", 300)
+        session_name = hashlib.sha256(b"thr-old").hexdigest()
+        session_path = self.root / "sessions" / f"{session_name}.json"
+        session_path.unlink()
+
+        stale_confirm = store.claim_confirm(older["pending_id"])
+        rebuilt = store.get_session_status("thr-old")
+
+        self.assertIsNone(stale_confirm)
+        self.assertEqual(
+            self.read_pending(older["pending_id"])["state"],
+            "cancelled",
+        )
+        self.assertEqual(rebuilt["pending_id"], newer["pending_id"])
+        self.assertEqual(rebuilt["generation"], newer_armed["generation"])
+        self.assertEqual(rebuilt["compaction_count"], 1)
+        self.assertEqual(rebuilt["compaction_sources"], {"manual": 1})
+        self.assertEqual(
+            rebuilt["prompt_fence_prepare_sequence"],
+            fenced["prompt_fence_prepare_sequence"],
+        )
+        self.assertEqual(self.read_session("thr-old"), rebuilt)
+
+    def test_interrupted_cache_write_does_not_reuse_durable_generation(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+        first = store.prepare("/repo", "first", "/repo/first.md")
+        first_armed = store.arm(first["pending_id"], "thr-old", 300)
+        second = store.prepare("/repo", "second", "/repo/second.md")
+        original_write_record = store._write_record
+
+        def fail_second_cache_write(path, record):
+            if (
+                path.parent == store.sessions_dir
+                and record.get("pending_id") == second["pending_id"]
+            ):
+                raise OSError("simulated cache write interruption")
+            return original_write_record(path, record)
+
+        store._write_record = fail_second_cache_write
+        with self.assertRaisesRegex(OSError, "cache write interruption"):
+            store.arm(second["pending_id"], "thr-old", 300)
+        store._write_record = original_write_record
+
+        durable_second = self.read_pending(second["pending_id"])
+        self.assertEqual(durable_second["generation"], 2)
+        self.assertEqual(self.read_session("thr-old"), first_armed)
+
+        third = store.prepare("/repo", "third", "/repo/third.md")
+        third_armed = store.arm(third["pending_id"], "thr-old", 300)
+
+        self.assertEqual(third_armed["generation"], 3)
+        self.assertEqual(store.get_session_status("thr-old"), third_armed)
+
+    def test_confirm_expire_and_new_arm_share_authority_without_deadlock(self):
+        for iteration in range(20):
+            with self.subTest(iteration=iteration):
+                case_root = self.root / f"authority-stress-{iteration}"
+                clock = [100.0]
+                store = StateStore(case_root, now=lambda: clock[0])
+                older = store.prepare("/repo", "older", "/repo/older.md")
+                store.arm(older["pending_id"], "thr-old", 300)
+                newer = store.prepare("/repo", "newer", "/repo/newer.md")
+                clock[0] = 400.0
+
+                results = self.run_race(
+                    lambda: store.claim_confirm(older["pending_id"]),
+                    lambda: store.claim_expired(older["pending_id"]),
+                    lambda: store.arm(newer["pending_id"], "thr-old", 300),
+                )
+                status = store.get_session_status("thr-old")
+
+                old_claims = [result for result in results[:2] if result]
+                self.assertLessEqual(len(old_claims), 1)
+                self.assertIsNotNone(results[2])
+                self.assertEqual(status["pending_id"], newer["pending_id"])
+                self.assertEqual(status["state"], "armed")
+
+    def test_respond_fences_prepared_arm_waiting_on_authority_window(self):
         store = StateStore(self.root, now=lambda: 100.0)
         older = store.prepare("/repo", "older", "/repo/older.md")
         store.arm(older["pending_id"], "thr-old", 300)
         newer = store.prepare("/repo", "newer", "/repo/newer.md")
         paused = threading.Event()
         resume = threading.Event()
-        original_session_locked = store._session_locked
-        respond_lock_count = 0
-        count_guard = threading.Lock()
+        arm_started = threading.Event()
+        arm_done = threading.Event()
+        original_authority_locked = store._authority_locked
 
-        class PausingSessionLock:
+        class PausingAuthorityLock:
             def __init__(self, inner):
                 self.inner = inner
 
             def __enter__(self):
+                entered = self.inner.__enter__()
                 paused.set()
                 if not resume.wait(timeout=5):
                     raise RuntimeError("respond race barrier timed out")
-                return self.inner.__enter__()
+                return entered
 
             def __exit__(self, *args):
                 return self.inner.__exit__(*args)
 
-        def controlled_session_lock(session_id):
-            nonlocal respond_lock_count
-            lock = original_session_locked(session_id)
-            if threading.current_thread().name != "respond-race":
-                return lock
-            with count_guard:
-                respond_lock_count += 1
-                should_pause = respond_lock_count == 2
-            return PausingSessionLock(lock) if should_pause else lock
+        def controlled_authority_lock(session_id):
+            lock = original_authority_locked(session_id)
+            if threading.current_thread().name == "respond-race":
+                return PausingAuthorityLock(lock)
+            return lock
 
-        store._session_locked = controlled_session_lock
-        result = []
+        store._authority_locked = controlled_authority_lock
+        respond_result = []
+        arm_result = []
         errors = []
 
         def respond():
             try:
-                result.append(store.respond("thr-old"))
+                respond_result.append(store.respond("thr-old"))
             except BaseException as error:
                 errors.append(error)
 
-        thread = threading.Thread(target=respond, name="respond-race")
-        thread.start()
-        self.assertTrue(paused.wait(timeout=5))
-        newer_armed = store.arm(newer["pending_id"], "thr-old", 300)
-        resume.set()
-        thread.join(timeout=5)
+        def arm():
+            try:
+                arm_started.set()
+                arm_result.append(store.arm(newer["pending_id"], "thr-old", 300))
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                arm_done.set()
 
-        self.assertFalse(thread.is_alive())
+        respond_thread = threading.Thread(target=respond, name="respond-race")
+        respond_thread.start()
+        self.assertTrue(paused.wait(timeout=5))
+        arm_thread = threading.Thread(target=arm, name="arm-race")
+        arm_thread.start()
+        self.assertTrue(arm_started.wait(timeout=5))
+        self.assertFalse(arm_done.wait(timeout=0.1))
+        resume.set()
+        respond_thread.join(timeout=5)
+        arm_thread.join(timeout=5)
+
+        self.assertFalse(respond_thread.is_alive())
+        self.assertFalse(arm_thread.is_alive())
         self.assertEqual(errors, [])
-        self.assertEqual(result[0]["pending_id"], newer["pending_id"])
-        self.assertEqual(result[0]["generation"], newer_armed["generation"])
-        self.assertEqual(result[0]["state"], "responded")
-        self.assertEqual(store.get_session_status("thr-old"), result[0])
+        self.assertEqual(respond_result[0]["pending_id"], older["pending_id"])
+        self.assertEqual(respond_result[0]["state"], "responded")
+        self.assertIsNone(arm_result[0])
+        self.assertEqual(
+            self.read_pending(newer["pending_id"])["cancel_reason"],
+            "prompt_fenced",
+        )
+        self.assertEqual(store.get_session_status("thr-old"), respond_result[0])
 
     def test_expiry_wins_against_late_response(self):
         clock = [100.0]
