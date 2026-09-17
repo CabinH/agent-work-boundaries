@@ -31,7 +31,8 @@ class _BoundedCapture:
             while True:
                 chunk = stream.read(1024)
                 if not chunk:
-                    return
+                    with self._lock:
+                        return "".join(self._chunks)
                 with self._lock:
                     remaining = self._limit - self._size
                     if remaining > 0:
@@ -39,7 +40,8 @@ class _BoundedCapture:
                         self._chunks.append(kept)
                         self._size += len(kept)
         except (OSError, ValueError):
-            return
+            with self._lock:
+                return "".join(self._chunks)
 
 
 class AppServerClient:
@@ -56,27 +58,41 @@ class AppServerClient:
     def launch(self, cwd: str, prompt: str) -> LaunchResult:
         self._start_daemon()
         process = self._start_proxy()
-        responses = queue.Queue()
-        stdout_thread = threading.Thread(
-            target=self._read_stdout,
-            args=(process.stdout, responses),
-            name="project-handoff-app-server-stdout",
-            daemon=True,
-        )
-        stderr_capture = _BoundedCapture(_STDERR_CAPTURE_LIMIT)
-        stderr_thread = threading.Thread(
-            target=stderr_capture.drain,
-            args=(process.stderr,),
-            name="project-handoff-app-server-stderr",
-            daemon=True,
-        )
-        stdout_thread.start()
-        stderr_thread.start()
-
+        writes = None
+        writer_thread = None
+        stdout_thread = None
+        stderr_thread = None
         try:
+            self._validate_proxy_streams(process)
+            responses = queue.Queue()
+            writes = queue.Queue()
+            writer_thread = threading.Thread(
+                target=self._write_stdin,
+                args=(process.stdin, writes),
+                name="project-handoff-app-server-stdin",
+                daemon=True,
+            )
+            stdout_thread = threading.Thread(
+                target=self._read_stdout,
+                args=(process.stdout, responses),
+                name="project-handoff-app-server-stdout",
+                daemon=True,
+            )
+            stderr_capture = _BoundedCapture(_STDERR_CAPTURE_LIMIT)
+            stderr_thread = threading.Thread(
+                target=stderr_capture.drain,
+                args=(process.stderr,),
+                name="project-handoff-app-server-stderr",
+                daemon=True,
+            )
+            writer_thread.start()
+            stdout_thread.start()
+            stderr_thread.start()
+
             self._request(
                 process,
                 responses,
+                writes,
                 1,
                 "initialize",
                 {
@@ -87,10 +103,15 @@ class AppServerClient:
                     "capabilities": {"experimentalApi": True},
                 },
             )
-            self._send(process, {"method": "initialized", "params": {}})
+            self._send(
+                writes,
+                {"method": "initialized", "params": {}},
+                deadline=time.monotonic() + self._request_timeout,
+            )
             thread_response = self._request(
                 process,
                 responses,
+                writes,
                 2,
                 "thread/start",
                 {"cwd": cwd},
@@ -103,6 +124,7 @@ class AppServerClient:
             turn_response = self._request(
                 process,
                 responses,
+                writes,
                 3,
                 "turn/start",
                 {
@@ -117,11 +139,17 @@ class AppServerClient:
             )
             return LaunchResult(thread_id=thread_id, turn_id=turn_id)
         finally:
-            self._cleanup_proxy(process, stdout_thread, stderr_thread)
+            self._cleanup_proxy(
+                process,
+                writes,
+                writer_thread,
+                stdout_thread,
+                stderr_thread,
+            )
 
     def _start_daemon(self):
         try:
-            self._run_command(
+            result = self._run_command(
                 ["codex", "app-server", "daemon", "start"],
                 check=True,
                 capture_output=True,
@@ -134,6 +162,12 @@ class AppServerClient:
             ) from None
         except (OSError, RuntimeError):
             raise AppServerError("app server daemon failed to start") from None
+        returncode = getattr(result, "returncode", 0)
+        if returncode:
+            raise AppServerError(
+                "app server daemon failed to start "
+                f"with exit status {returncode}"
+            )
 
     def _start_proxy(self):
         try:
@@ -147,15 +181,19 @@ class AppServerClient:
             )
         except (OSError, RuntimeError):
             raise AppServerError("app server proxy failed to start") from None
-        if process.stdin is None or process.stdout is None or process.stderr is None:
-            raise AppServerError("app server proxy streams are unavailable")
         return process
 
-    def _request(self, process, responses, request_id, method, params):
+    @staticmethod
+    def _validate_proxy_streams(process):
+        if process.stdin is None or process.stdout is None or process.stderr is None:
+            raise AppServerError("app server proxy streams are unavailable")
+
+    def _request(self, process, responses, writes, request_id, method, params):
         deadline = time.monotonic() + self._request_timeout
         self._send(
-            process,
+            writes,
             {"id": request_id, "method": method, "params": params},
+            deadline,
         )
         while True:
             remaining = deadline - time.monotonic()
@@ -210,13 +248,36 @@ class AppServerClient:
         return result_id
 
     @staticmethod
-    def _send(process, message):
-        try:
-            process.stdin.write(json.dumps(message) + "\n")
-            process.stdin.flush()
-        except (BrokenPipeError, OSError, ValueError):
+    def _send(writes, message, deadline):
+        completion = queue.Queue(maxsize=1)
+        writes.put((json.dumps(message) + "\n", completion))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             method = message.get("method", "request")
-            raise AppServerError(f"{method} could not be sent to the proxy") from None
+            raise AppServerError(f"{method} timed out while sending")
+        try:
+            error = completion.get(timeout=remaining)
+        except queue.Empty:
+            method = message.get("method", "request")
+            raise AppServerError(f"{method} timed out while sending") from None
+        if error is not None:
+            method = message.get("method", "request")
+            raise AppServerError(f"{method} could not be sent to the proxy")
+
+    @staticmethod
+    def _write_stdin(stream, writes):
+        while True:
+            job = writes.get()
+            if job is None:
+                return
+            payload, completion = job
+            try:
+                stream.write(payload)
+                stream.flush()
+            except (BrokenPipeError, OSError, ValueError) as error:
+                completion.put(error)
+            else:
+                completion.put(None)
 
     @staticmethod
     def _read_stdout(stream, responses):
@@ -230,28 +291,46 @@ class AppServerClient:
         except (OSError, ValueError) as error:
             responses.put(("read_error", error))
 
-    def _cleanup_proxy(self, process, stdout_thread, stderr_thread):
-        try:
-            process.stdin.close()
-        except (OSError, ValueError):
-            pass
+    def _cleanup_proxy(
+        self,
+        process,
+        writes,
+        writer_thread,
+        stdout_thread,
+        stderr_thread,
+    ):
         try:
             process.terminate()
         except (OSError, ProcessLookupError):
             pass
         try:
             process.wait(timeout=max(self._request_timeout, 0.1))
-        except (OSError, subprocess.TimeoutExpired):
+        except subprocess.TimeoutExpired:
             kill = getattr(process, "kill", None)
             if kill is not None:
                 try:
                     kill()
                 except (OSError, ProcessLookupError):
                     pass
-        for stream in (process.stdout, process.stderr):
+                try:
+                    process.wait(timeout=max(self._request_timeout, 0.1))
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+        except OSError:
+            pass
+        for stream in (
+            getattr(process, "stdin", None),
+            getattr(process, "stdout", None),
+            getattr(process, "stderr", None),
+        ):
+            if stream is None:
+                continue
             try:
                 stream.close()
             except (OSError, ValueError):
                 pass
-        stdout_thread.join(timeout=0.1)
-        stderr_thread.join(timeout=0.1)
+        if writes is not None:
+            writes.put(None)
+        for thread in (writer_thread, stdout_thread, stderr_thread):
+            if thread is not None:
+                thread.join(timeout=0.1)

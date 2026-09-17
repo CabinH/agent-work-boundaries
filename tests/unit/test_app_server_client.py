@@ -4,7 +4,6 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
-import time
 import unittest
 
 
@@ -29,6 +28,26 @@ class RecordingInput(io.StringIO):
         self.was_closed = True
 
 
+class BlockingInput(RecordingInput):
+    def __init__(self, block_on_write=1):
+        super().__init__()
+        self._block_on_write = block_on_write
+        self._write_count = 0
+        self.write_entered = threading.Event()
+        self.release_write = threading.Event()
+
+    def write(self, value):
+        self._write_count += 1
+        if self._write_count == self._block_on_write:
+            self.write_entered.set()
+            self.release_write.wait()
+        return super().write(value)
+
+    def close(self):
+        self.release_write.set()
+        super().close()
+
+
 class TrackedStringIO(io.StringIO):
     def __init__(self, value=""):
         super().__init__(value)
@@ -39,19 +58,18 @@ class TrackedStringIO(io.StringIO):
         super().close()
 
 
-class DelayedEOF:
-    def __init__(self, first_line, delay=0.1):
-        self._first_line = first_line
-        self._delay = delay
+class BlockingOutput:
+    def __init__(self, lines):
+        self._lines = list(lines)
+        self.read_blocked = threading.Event()
         self._unblock = threading.Event()
         self.was_closed = False
 
     def readline(self):
-        if self._first_line is not None:
-            line = self._first_line
-            self._first_line = None
-            return line
-        self._unblock.wait(self._delay)
+        if self._lines:
+            return self._lines.pop(0)
+        self.read_blocked.set()
+        self._unblock.wait()
         return ""
 
     def close(self):
@@ -77,6 +95,26 @@ class FakeProcess:
         return 0
 
 
+class TerminateTimeoutProcess(FakeProcess):
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.lifecycle = []
+
+    def terminate(self):
+        self.lifecycle.append("terminate")
+        super().terminate()
+
+    def wait(self, timeout=None):
+        self.lifecycle.append("wait")
+        if self.lifecycle.count("wait") == 1:
+            raise subprocess.TimeoutExpired("codex app-server proxy", timeout)
+        self.waited = True
+        return 0
+
+    def kill(self):
+        self.lifecycle.append("kill")
+
+
 class AppServerClientTests(unittest.TestCase):
     def make_client(self, process, run_command=None, request_timeout=1.0):
         if run_command is None:
@@ -94,6 +132,122 @@ class AppServerClientTests(unittest.TestCase):
         self.assertTrue(process.terminated)
         self.assertTrue(process.waited)
 
+    def test_launch_times_out_when_proxy_stops_consuming_stdin(self):
+        process = FakeProcess(
+            [
+                {"id": 1, "result": {"capabilities": {}}},
+                {"id": 2, "result": {"thread": {"id": "thr-new"}}},
+                {"id": 3, "result": {"turn": {"id": "turn-new"}}},
+            ]
+        )
+        process.stdin = BlockingInput()
+        client = self.make_client(process, request_timeout=0.01)
+        outcome = []
+
+        def launch():
+            try:
+                client.launch("/workspace/repo", "private recovery prompt")
+            except BaseException as error:
+                outcome.append(error)
+            else:
+                outcome.append(None)
+
+        launch_thread = threading.Thread(target=launch, daemon=True)
+        launch_thread.start()
+        self.assertTrue(process.stdin.write_entered.wait(timeout=1))
+        launch_thread.join(timeout=1)
+        was_still_blocked = launch_thread.is_alive()
+        if was_still_blocked:
+            process.stdin.release_write.set()
+            launch_thread.join(timeout=1)
+
+        self.assertFalse(was_still_blocked, "launch ignored its write deadline")
+        self.assertEqual(len(outcome), 1)
+        self.assertIsInstance(outcome[0], app_server_client.AppServerError)
+        self.assertRegex(str(outcome[0]), "initialize.*timed out")
+        self.assertNotIn("private recovery prompt", str(outcome[0]))
+        self.assert_proxy_cleaned_up(process)
+
+    def test_launch_bounds_initialized_notification_write(self):
+        process = FakeProcess(
+            [
+                {"id": 1, "result": {"capabilities": {}}},
+                {"id": 2, "result": {"thread": {"id": "thr-new"}}},
+                {"id": 3, "result": {"turn": {"id": "turn-new"}}},
+            ]
+        )
+        process.stdin = BlockingInput(block_on_write=2)
+        client = self.make_client(process, request_timeout=0.01)
+        outcome = []
+
+        def launch():
+            try:
+                client.launch("/workspace/repo", "private recovery prompt")
+            except BaseException as error:
+                outcome.append(error)
+            else:
+                outcome.append(None)
+
+        launch_thread = threading.Thread(target=launch, daemon=True)
+        launch_thread.start()
+        self.assertTrue(process.stdin.write_entered.wait(timeout=1))
+        launch_thread.join(timeout=1)
+        was_still_blocked = launch_thread.is_alive()
+        if was_still_blocked:
+            process.stdin.release_write.set()
+            launch_thread.join(timeout=1)
+
+        self.assertFalse(was_still_blocked, "initialized write ignored its deadline")
+        self.assertEqual(len(outcome), 1)
+        self.assertIsInstance(outcome[0], app_server_client.AppServerError)
+        self.assertRegex(str(outcome[0]), "initialized.*timed out")
+        self.assertNotIn("private recovery prompt", str(outcome[0]))
+        self.assert_proxy_cleaned_up(process)
+
+    def test_launch_cleans_up_proxy_with_missing_stream(self):
+        process = FakeProcess(
+            [
+                {"id": 1, "result": {"capabilities": {}}},
+                {"id": 2, "result": {"thread": {"id": "thr-new"}}},
+                {"id": 3, "result": {"turn": {"id": "turn-new"}}},
+            ]
+        )
+        process.stdout = None
+        client = self.make_client(process)
+
+        with self.assertRaisesRegex(
+            app_server_client.AppServerError,
+            "proxy streams are unavailable",
+        ):
+            client.launch("/workspace/repo", "private recovery prompt")
+
+        self.assertTrue(process.stdin.was_closed)
+        self.assertTrue(process.stderr.was_closed)
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.waited)
+
+    def test_launch_reaps_proxy_after_terminate_timeout(self):
+        process = TerminateTimeoutProcess(
+            [
+                {"id": 1, "result": {"capabilities": {}}},
+                {"id": 2, "result": {"thread": {"id": "thr-new"}}},
+                {"id": 3, "result": {"turn": {"id": "turn-new"}}},
+            ]
+        )
+        client = self.make_client(process)
+
+        result = client.launch("/workspace/repo", "resume from handoff")
+
+        self.assertEqual(
+            result,
+            LaunchResult(thread_id="thr-new", turn_id="turn-new"),
+        )
+        self.assertEqual(
+            process.lifecycle,
+            ["terminate", "wait", "kill", "wait"],
+        )
+        self.assertTrue(process.waited)
+
     def test_launch_starts_thread_and_turn(self):
         process = FakeProcess(
             [
@@ -106,10 +260,10 @@ class AppServerClientTests(unittest.TestCase):
         proxy_commands = []
 
         def run_command(command, **kwargs):
-            daemon_commands.append(command)
+            daemon_commands.append((command, kwargs))
 
         def popen_factory(command, **kwargs):
-            proxy_commands.append(command)
+            proxy_commands.append((command, kwargs))
             return process
 
         client = AppServerClient(
@@ -164,13 +318,72 @@ class AppServerClientTests(unittest.TestCase):
         )
         self.assertEqual(
             daemon_commands,
-            [["codex", "app-server", "daemon", "start"]],
+            [
+                (
+                    ["codex", "app-server", "daemon", "start"],
+                    {
+                        "check": True,
+                        "capture_output": True,
+                        "text": True,
+                    },
+                )
+            ],
         )
         self.assertEqual(
             proxy_commands,
-            [["codex", "app-server", "proxy"]],
+            [
+                (
+                    ["codex", "app-server", "proxy"],
+                    {
+                        "stdin": subprocess.PIPE,
+                        "stdout": subprocess.PIPE,
+                        "stderr": subprocess.PIPE,
+                        "text": True,
+                        "bufsize": 1,
+                    },
+                )
+            ],
         )
         self.assert_proxy_cleaned_up(process)
+
+    def test_launch_rejects_returned_nonzero_daemon_status(self):
+        process = FakeProcess(
+            [
+                {"id": 1, "result": {"capabilities": {}}},
+                {"id": 2, "result": {"thread": {"id": "thr-new"}}},
+                {"id": 3, "result": {"turn": {"id": "turn-new"}}},
+            ]
+        )
+        proxy_started = []
+
+        def return_failure(command, **kwargs):
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=9,
+                stdout="",
+                stderr="Bearer should-not-leak",
+            )
+
+        def start_proxy(command, **kwargs):
+            proxy_started.append(command)
+            return process
+
+        client = AppServerClient(
+            run_command=return_failure,
+            popen_factory=start_proxy,
+            request_timeout=1.0,
+        )
+
+        with self.assertRaisesRegex(
+            app_server_client.AppServerError,
+            "daemon.*9",
+        ) as raised:
+            client.launch("/workspace/repo", "private recovery prompt")
+
+        self.assertNotIn("Bearer", str(raised.exception))
+        self.assertNotIn("private recovery prompt", str(raised.exception))
+        self.assertEqual(proxy_started, [])
+        self.assertFalse(process.terminated)
 
     def test_launch_surfaces_daemon_start_failure(self):
         process = FakeProcess()
@@ -263,22 +476,37 @@ class AppServerClientTests(unittest.TestCase):
         initialize_response = json.dumps(
             {"id": 1, "result": {"capabilities": {}}}
         ) + "\n"
+        stdout = BlockingOutput([initialize_response])
         process = FakeProcess(
-            stdout=DelayedEOF(initialize_response),
+            stdout=stdout,
         )
         client = self.make_client(
             process,
             request_timeout=0.01,
         )
-        started_at = time.monotonic()
+        outcome = []
 
-        with self.assertRaisesRegex(
-            app_server_client.AppServerError,
-            "thread/start.*timed out",
-        ):
-            client.launch("/workspace/repo", "resume from the handoff")
+        def launch():
+            try:
+                client.launch("/workspace/repo", "resume from the handoff")
+            except BaseException as error:
+                outcome.append(error)
+            else:
+                outcome.append(None)
 
-        self.assertLess(time.monotonic() - started_at, 0.08)
+        launch_thread = threading.Thread(target=launch, daemon=True)
+        launch_thread.start()
+        self.assertTrue(stdout.read_blocked.wait(timeout=1))
+        launch_thread.join(timeout=1)
+        was_still_blocked = launch_thread.is_alive()
+        if was_still_blocked:
+            stdout.close()
+            launch_thread.join(timeout=1)
+
+        self.assertFalse(was_still_blocked, "launch ignored its response deadline")
+        self.assertEqual(len(outcome), 1)
+        self.assertIsInstance(outcome[0], app_server_client.AppServerError)
+        self.assertRegex(str(outcome[0]), "thread/start.*timed out")
         self.assert_proxy_cleaned_up(process)
 
     def test_notifications_do_not_consume_response_ids(self):
@@ -311,7 +539,7 @@ class AppServerClientTests(unittest.TestCase):
         )
 
     def test_launch_bounds_proxy_stderr_on_malformed_response(self):
-        stderr = "x" * 100_000 + "Bearer should-not-leak"
+        stderr = "Bearer should-not-leak" + "x" * 100_000
         process = FakeProcess(
             stdout=TrackedStringIO("not-json\n"),
             stderr=stderr,
@@ -324,6 +552,17 @@ class AppServerClientTests(unittest.TestCase):
         self.assertNotIn("Bearer", str(raised.exception))
         self.assertNotIn("private recovery prompt", str(raised.exception))
         self.assert_proxy_cleaned_up(process)
+
+    def test_stderr_capture_retains_only_bounded_prefix(self):
+        stderr = "sensitive-prefix:" + "x" * 10_000
+        capture = app_server_client._BoundedCapture(
+            limit=app_server_client._STDERR_CAPTURE_LIMIT
+        )
+
+        retained = capture.drain(io.StringIO(stderr))
+
+        self.assertEqual(len(retained), 4096)
+        self.assertEqual(retained, stderr[:4096])
 
 
 if __name__ == "__main__":
