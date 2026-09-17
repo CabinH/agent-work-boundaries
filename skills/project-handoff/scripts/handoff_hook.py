@@ -26,6 +26,7 @@ _PROMPT_FAILURE_DIAGNOSTIC = (
     "project-handoff-hook-error:user-prompt-submit\n"
 )
 _EVENT_FAILURE_DIAGNOSTIC = "project-handoff-hook-error:event\n"
+_PROMPT_AUTHORITY_RETRY_LIMIT = 8
 
 
 def handle_event(
@@ -202,27 +203,10 @@ def _handle_user_prompt(payload, service, spawn_worker):
 
     responded = service.respond(session_id)
     if responded is not None:
-        pending_id = str(responded["pending_id"])
-        confirm_command = _control_command(
-            "confirm",
-            "--pending-id",
-            pending_id,
-        )
-        cancel_command = _control_command(
-            "cancel",
-            "--pending-id",
-            pending_id,
-        )
-        return _additional_context(
-            "UserPromptSubmit",
-            (
-                "A pending handoff countdown was cancelled by this prompt. "
-                "If the user confirms, run "
-                f"{confirm_command}; "
-                "if the user rejects, run "
-                f"{cancel_command}; "
-                "otherwise continue here and do not transfer automatically."
-            ),
+        return _revalidate_prompt_response(
+            service,
+            session_id,
+            responded,
         )
 
     status = service.status(session_id)
@@ -238,6 +222,64 @@ def _handle_user_prompt(payload, service, spawn_worker):
             )
         return _in_progress_block(session_id)
     return None
+
+
+def _revalidate_prompt_response(service, session_id, responded):
+    for _attempt in range(_PROMPT_AUTHORITY_RETRY_LIMIT):
+        status = service.status(session_id)
+        if not isinstance(status, dict):
+            return _in_progress_block(session_id)
+        state = status.get("state")
+        same_generation = _same_bound_generation(responded, status)
+        if state == "responded":
+            return _responded_prompt_output(status)
+        if state == "armed":
+            responded = service.respond(session_id)
+            if responded is None:
+                continue
+            continue
+        terminal_output = _terminal_prompt_output(status, session_id)
+        if terminal_output is not None and same_generation:
+            return terminal_output
+        if state == "cancelled" and same_generation:
+            return None
+        return _in_progress_block(session_id)
+    return _in_progress_block(session_id)
+
+
+def _same_bound_generation(left, right):
+    if left.get("pending_id") != right.get("pending_id"):
+        return False
+    left_generation = left.get("generation")
+    right_generation = right.get("generation")
+    if isinstance(left_generation, int) and isinstance(right_generation, int):
+        return left_generation == right_generation
+    return True
+
+
+def _responded_prompt_output(responded):
+    pending_id = str(responded["pending_id"])
+    confirm_command = _control_command(
+        "confirm",
+        "--pending-id",
+        pending_id,
+    )
+    cancel_command = _control_command(
+        "cancel",
+        "--pending-id",
+        pending_id,
+    )
+    return _additional_context(
+        "UserPromptSubmit",
+        (
+            "A pending handoff countdown was cancelled by this prompt. "
+            "If the user confirms, run "
+            f"{confirm_command}; "
+            "if the user rejects, run "
+            f"{cancel_command}; "
+            "otherwise continue here and do not transfer automatically."
+        ),
+    )
 
 
 def _terminal_prompt_output(status, session_id):

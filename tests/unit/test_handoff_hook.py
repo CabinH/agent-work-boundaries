@@ -19,6 +19,7 @@ import handoff_hook
 
 
 PENDING_ID = "123e4567-e89b-42d3-a456-426614174000"
+NEW_PENDING_ID = "223e4567-e89b-42d3-a456-426614174000"
 QUOTED_PYTHON = "/opt/Codex Python/bin/python3"
 QUOTED_HANDOFFCTL = Path(
     "/installed/project handoff/scripts/handoffctl.py"
@@ -316,6 +317,89 @@ class HandoffHookStopAndPromptTests(unittest.TestCase):
                 )
                 self.assertIn("otherwise continue here", context)
                 self.assertLess(len(context.split()), 120)
+
+    def test_prompt_revalidates_and_cancels_new_generation_before_success(self):
+        class NewGenerationDuringRespondService(FakeService):
+            def __init__(self):
+                super().__init__(
+                    {
+                        "thr-old": {
+                            "pending_id": PENDING_ID,
+                            "session_id": "thr-old",
+                            "generation": 1,
+                            "state": "armed",
+                        }
+                    }
+                )
+
+            def respond(self, session_id):
+                self.respond_calls.append(session_id)
+                current = self.records[session_id]
+                if len(self.respond_calls) == 1:
+                    responded = dict(current, state="responded")
+                    self.records[session_id] = {
+                        "pending_id": NEW_PENDING_ID,
+                        "session_id": session_id,
+                        "generation": 2,
+                        "state": "armed",
+                    }
+                    return responded
+                responded = dict(current, state="responded")
+                self.records[session_id] = responded
+                return responded
+
+        service = NewGenerationDuringRespondService()
+
+        result = handoff_hook.handle_event(
+            prompt_event(),
+            service,
+            RecordingSpawner(),
+        )
+
+        context = result["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(service.respond_calls, ["thr-old", "thr-old"])
+        self.assertEqual(service.records["thr-old"]["state"], "responded")
+        self.assertIn(f"confirm --pending-id {NEW_PENDING_ID}", context)
+        self.assertNotIn(f"confirm --pending-id {PENDING_ID}", context)
+
+    def test_prompt_generation_churn_blocks_after_bounded_revalidation(self):
+        class ChurningGenerationService(FakeService):
+            def __init__(self):
+                super().__init__()
+                self.generation = 1
+
+            def status(self, session_id):
+                self.status_calls.append(session_id)
+                return {
+                    "pending_id": NEW_PENDING_ID,
+                    "session_id": session_id,
+                    "generation": self.generation,
+                    "state": "armed",
+                }
+
+            def respond(self, session_id):
+                self.respond_calls.append(session_id)
+                responded = {
+                    "pending_id": NEW_PENDING_ID,
+                    "session_id": session_id,
+                    "generation": self.generation,
+                    "state": "responded",
+                }
+                self.generation += 1
+                return responded
+
+        service = ChurningGenerationService()
+
+        result = handoff_hook.handle_event(
+            prompt_event(),
+            service,
+            RecordingSpawner(),
+        )
+
+        self.assertEqual(result["decision"], "block")
+        self.assertIn("status --session-id thr-old", result["reason"])
+        self.assertLessEqual(len(service.respond_calls), 9)
+        self.assertLessEqual(len(service.status_calls), 9)
 
     def test_user_prompt_guidance_uses_copyable_installed_commands(self):
         service = FakeService(

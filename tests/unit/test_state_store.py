@@ -247,6 +247,118 @@ class StateStoreTests(unittest.TestCase):
         )
         self.assertEqual(status["pending_id"], generation_two["pending_id"])
 
+    def test_status_never_downgrades_cache_when_new_arm_wins_scan_race(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+        older = store.prepare("/repo", "older", "/repo/older.md")
+        store.arm(older["pending_id"], "thr-old", 300)
+        newer = store.prepare("/repo", "newer", "/repo/newer.md")
+        paused = threading.Event()
+        resume = threading.Event()
+        original_session_locked = store._session_locked
+
+        class PausingSessionLock:
+            def __init__(self, inner):
+                self.inner = inner
+
+            def __enter__(self):
+                paused.set()
+                if not resume.wait(timeout=5):
+                    raise RuntimeError("status race barrier timed out")
+                return self.inner.__enter__()
+
+            def __exit__(self, *args):
+                return self.inner.__exit__(*args)
+
+        def controlled_session_lock(session_id):
+            lock = original_session_locked(session_id)
+            if threading.current_thread().name == "status-race":
+                return PausingSessionLock(lock)
+            return lock
+
+        store._session_locked = controlled_session_lock
+        result = []
+        errors = []
+
+        def lookup():
+            try:
+                result.append(store.get_session_status("thr-old"))
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=lookup, name="status-race")
+        thread.start()
+        self.assertTrue(paused.wait(timeout=5))
+        newer_armed = store.arm(newer["pending_id"], "thr-old", 300)
+        resume.set()
+        thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result[0]["pending_id"], newer["pending_id"])
+        self.assertEqual(result[0]["generation"], newer_armed["generation"])
+        self.assertEqual(
+            self.read_session("thr-old")["pending_id"],
+            newer["pending_id"],
+        )
+
+    def test_respond_retries_when_new_arm_wins_authority_window(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+        older = store.prepare("/repo", "older", "/repo/older.md")
+        store.arm(older["pending_id"], "thr-old", 300)
+        newer = store.prepare("/repo", "newer", "/repo/newer.md")
+        paused = threading.Event()
+        resume = threading.Event()
+        original_session_locked = store._session_locked
+        respond_lock_count = 0
+        count_guard = threading.Lock()
+
+        class PausingSessionLock:
+            def __init__(self, inner):
+                self.inner = inner
+
+            def __enter__(self):
+                paused.set()
+                if not resume.wait(timeout=5):
+                    raise RuntimeError("respond race barrier timed out")
+                return self.inner.__enter__()
+
+            def __exit__(self, *args):
+                return self.inner.__exit__(*args)
+
+        def controlled_session_lock(session_id):
+            nonlocal respond_lock_count
+            lock = original_session_locked(session_id)
+            if threading.current_thread().name != "respond-race":
+                return lock
+            with count_guard:
+                respond_lock_count += 1
+                should_pause = respond_lock_count == 2
+            return PausingSessionLock(lock) if should_pause else lock
+
+        store._session_locked = controlled_session_lock
+        result = []
+        errors = []
+
+        def respond():
+            try:
+                result.append(store.respond("thr-old"))
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=respond, name="respond-race")
+        thread.start()
+        self.assertTrue(paused.wait(timeout=5))
+        newer_armed = store.arm(newer["pending_id"], "thr-old", 300)
+        resume.set()
+        thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result[0]["pending_id"], newer["pending_id"])
+        self.assertEqual(result[0]["generation"], newer_armed["generation"])
+        self.assertEqual(result[0]["state"], "responded")
+        self.assertEqual(store.get_session_status("thr-old"), result[0])
+
     def test_expiry_wins_against_late_response(self):
         clock = [100.0]
         store = StateStore(self.root, now=lambda: clock[0])

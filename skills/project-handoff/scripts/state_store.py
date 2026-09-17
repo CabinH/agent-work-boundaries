@@ -36,6 +36,11 @@ _ATTEMPT_DIAGNOSTIC_KEYS = (
     "indeterminate_at",
 )
 _REQUEST_HISTORY_LIMIT = 20
+_AUTHORITY_RETRY_LIMIT = 8
+
+
+class StateAuthorityError(RuntimeError):
+    """Concurrent generation churn prevented a stable session decision."""
 
 
 class StateStore:
@@ -106,20 +111,37 @@ class StateStore:
             return record
 
     def respond(self, session_id: str) -> dict[str, object] | None:
-        session_record = self.get_session_status(session_id)
-        if session_record is None or "pending_id" not in session_record:
-            return None
-        pending_id = str(session_record["pending_id"])
-        with self._locked(pending_id):
-            record = self._read_record(self._pending_path(pending_id))
-            if record["state"] != "armed":
+        session_path = self._session_path(session_id)
+        for _attempt in range(_AUTHORITY_RETRY_LIMIT):
+            session_record = self.get_session_status(session_id)
+            if session_record is None or "pending_id" not in session_record:
                 return None
-            if self.now() >= float(record["deadline_at"]):
-                return None
-            self._set_state(record, "responded")
-            record["responded_at"] = self.now()
-            self._persist(record)
-            return record
+            pending_id = str(session_record["pending_id"])
+            with self._locked(pending_id):
+                record = self._read_record(self._pending_path(pending_id))
+                with self._session_locked(session_id):
+                    cached = (
+                        self._read_record(session_path)
+                        if session_path.exists()
+                        else None
+                    )
+                    if not self._same_bound_generation(record, cached):
+                        continue
+                    if record["state"] != "armed":
+                        return None
+                    timestamp = self.now()
+                    if timestamp >= float(record["deadline_at"]):
+                        return None
+                    self._set_state(record, "responded")
+                    record["responded_at"] = timestamp
+                    self._copy_compaction_metadata(cached, record)
+                    self._write_record(
+                        self._pending_path(pending_id),
+                        record,
+                    )
+                    self._write_record(session_path, record)
+                    return record
+        raise StateAuthorityError("session authority changed repeatedly")
 
     def claim_confirm(self, pending_id: str) -> dict[str, object] | None:
         with self._locked(pending_id):
@@ -339,7 +361,40 @@ class StateStore:
 
     def get_session_status(self, session_id: str) -> dict[str, object] | None:
         path = self._session_path(session_id)
-        cached = self._read_record(path) if path.exists() else None
+        for _attempt in range(_AUTHORITY_RETRY_LIMIT):
+            candidates = self._session_candidates(session_id)
+            if not candidates:
+                with self._session_locked(session_id):
+                    return self._read_record(path) if path.exists() else None
+
+            selected = max(candidates, key=self._session_record_rank)
+            pending_id = str(selected["pending_id"])
+            with self._locked(pending_id):
+                pending_path = self._pending_path(pending_id)
+                if not pending_path.exists():
+                    continue
+                record = self._read_record(pending_path)
+                if record.get("session_id") != session_id:
+                    continue
+                with self._session_locked(session_id):
+                    current_cache = (
+                        self._read_record(path) if path.exists() else None
+                    )
+                    if (
+                        current_cache is not None
+                        and self._session_record_rank(current_cache)
+                        > self._session_record_rank(record)
+                    ):
+                        continue
+                    self._copy_compaction_metadata(current_cache, record)
+                    self._write_record(path, record)
+                    return record
+        raise StateAuthorityError("session authority changed repeatedly")
+
+    def _session_candidates(
+        self,
+        session_id: str,
+    ) -> list[dict[str, object]]:
         candidates: list[dict[str, object]] = []
         for pending_path in self.pending_dir.glob("*.json"):
             pending_id = pending_path.stem
@@ -352,21 +407,7 @@ class StateStore:
                     record = self._read_record(pending_path)
                     if record.get("session_id") == session_id:
                         candidates.append(record)
-        if not candidates:
-            return cached
-
-        record = max(candidates, key=self._session_record_rank)
-        pending_id = str(record["pending_id"])
-        with self._locked(pending_id):
-            record = self._read_record(self._pending_path(pending_id))
-            with self._session_locked(session_id):
-                if path.exists():
-                    current_cache = self._read_record(path)
-                    for key in ("compaction_count", "compaction_sources"):
-                        if key in current_cache:
-                            record[key] = current_cache[key]
-                self._write_record(path, record)
-        return record
+        return candidates
 
     def _pending_path(self, pending_id: str) -> Path:
         self._validate_pending_id(pending_id)
@@ -480,6 +521,19 @@ class StateStore:
         if isinstance(generation, int) and not isinstance(generation, bool):
             return max(generation, 0)
         return 0
+
+    @staticmethod
+    def _same_bound_generation(
+        left: dict[str, object] | None,
+        right: dict[str, object] | None,
+    ) -> bool:
+        if left is None or right is None:
+            return False
+        return (
+            left.get("pending_id") == right.get("pending_id")
+            and StateStore._record_generation(left)
+            == StateStore._record_generation(right)
+        )
 
     @staticmethod
     def _validate_pending_id(pending_id: str) -> None:
