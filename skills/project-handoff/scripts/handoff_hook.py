@@ -13,10 +13,19 @@ import sys
 HANDOFFCTL_PATH = Path(__file__).with_name("handoffctl.py").resolve()
 
 _PENDING_MARKER = re.compile(
-    r"<!-- project-handoff:pending="
+    r"^<!-- project-handoff:pending="
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+    r" -->$"
+)
+_PENDING_MARKER_TOKEN = re.compile(
+    r"<!-- project-handoff:pending="
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
     r" -->"
 )
+_PROMPT_FAILURE_DIAGNOSTIC = (
+    "project-handoff-hook-error:user-prompt-submit\n"
+)
+_EVENT_FAILURE_DIAGNOSTIC = "project-handoff-hook-error:event\n"
 
 
 def handle_event(
@@ -31,12 +40,72 @@ def handle_event(
     if event_name == "Stop":
         return _handle_stop(payload, service, spawn_worker)
     if event_name == "UserPromptSubmit":
-        return _handle_user_prompt(payload, service)
+        return _handle_user_prompt(payload, service, spawn_worker)
     if event_name == "PostCompact":
         return _handle_post_compact(payload, service)
     if event_name == "SessionStart":
-        return _handle_session_start(payload, service)
+        return _handle_session_start(payload, service, spawn_worker)
     return None
+
+
+def _final_pending_marker(message):
+    if len(_PENDING_MARKER_TOKEN.findall(message)) != 1:
+        return None
+    lines = message.splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return None
+    matches = []
+    for index, line in enumerate(lines):
+        match = _PENDING_MARKER.fullmatch(line)
+        if match is not None:
+            matches.append((index, match.group(1)))
+    if len(matches) != 1 or matches[0][0] != len(lines) - 1:
+        return None
+    marker_index, pending_id = matches[0]
+    if _line_is_inside_fence(lines, marker_index):
+        return None
+    return pending_id
+
+
+def _line_is_inside_fence(lines, target_index):
+    fence_character = None
+    fence_length = 0
+    for line in lines[:target_index]:
+        leading_spaces = len(line) - len(line.lstrip(" "))
+        if line.startswith("\t") or leading_spaces > 3:
+            continue
+        content = line[leading_spaces:]
+        if fence_character is None:
+            if content.startswith(("```", "~~~")):
+                fence_character = content[0]
+                fence_length = len(content) - len(
+                    content.lstrip(fence_character)
+                )
+            continue
+        run_length = len(content) - len(content.lstrip(fence_character))
+        if run_length >= fence_length and not content[run_length:].strip():
+            fence_character = None
+            fence_length = 0
+    return fence_character is not None
+
+
+def _spawn_wait_worker(pending_id, spawn_worker):
+    return spawn_worker(
+        [
+            sys.executable,
+            str(HANDOFFCTL_PATH),
+            "wait",
+            "--pending-id",
+            pending_id,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
 
 
 def _handle_stop(payload, service, spawn_worker):
@@ -46,28 +115,14 @@ def _handle_stop(payload, service, spawn_worker):
         return None
     if not isinstance(message, str):
         return None
-    matches = _PENDING_MARKER.findall(message)
-    if len(matches) != 1:
+    pending_id = _final_pending_marker(message)
+    if pending_id is None:
         return None
-    pending_id = matches[0]
     armed = service.arm(pending_id, session_id, 300)
     if armed is None:
         return None
     try:
-        spawn_worker(
-            [
-                sys.executable,
-                str(HANDOFFCTL_PATH),
-                "wait",
-                "--pending-id",
-                pending_id,
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
-        )
+        _spawn_wait_worker(pending_id, spawn_worker)
     except Exception:
         disabled = None
         try:
@@ -132,7 +187,7 @@ def _handle_stop(payload, service, spawn_worker):
     return None
 
 
-def _handle_user_prompt(payload, service):
+def _handle_user_prompt(payload, service, spawn_worker):
     session_id = payload.get("session_id")
     prompt = payload.get("prompt")
     if not isinstance(session_id, str) or not session_id:
@@ -175,6 +230,12 @@ def _handle_user_prompt(payload, service):
     if terminal_output is not None:
         return terminal_output
     if isinstance(status, dict) and status.get("state") == "armed":
+        if status.get("overdue") is True:
+            return _restart_overdue_for_prompt(
+                status,
+                session_id,
+                spawn_worker,
+            )
         return _in_progress_block(session_id)
     return None
 
@@ -202,7 +263,18 @@ def _terminal_prompt_output(status, session_id):
             "UserPromptSubmit",
             context,
         )
-    if state in {"transferring", "expired"}:
+    if state in {
+        "transferring",
+        "expired",
+        "thread_starting",
+        "turn_starting",
+        "indeterminate",
+    }:
+        return _in_progress_block(session_id)
+    if state == "thread_created":
+        pending_id = status.get("pending_id")
+        if isinstance(pending_id, str) and pending_id:
+            return _thread_created_block(session_id, pending_id)
         return _in_progress_block(session_id)
     return None
 
@@ -224,6 +296,70 @@ def _in_progress_block(session_id):
     }
 
 
+def _thread_created_block(session_id, pending_id):
+    confirm_command = _control_command(
+        "confirm",
+        "--pending-id",
+        pending_id,
+    )
+    status_command = _control_command(
+        "status",
+        "--session-id",
+        session_id,
+    )
+    return {
+        "decision": "block",
+        "reason": (
+            "This conversation already created the replacement thread; do "
+            "not continue old-thread work here. To resume only the unsent "
+            f"turn, run {confirm_command}. To inspect first, run "
+            f"{status_command}."
+        ),
+    }
+
+
+def _restart_overdue_for_prompt(status, session_id, spawn_worker):
+    pending_id = status.get("pending_id")
+    if not isinstance(pending_id, str) or not pending_id:
+        return _in_progress_block(session_id)
+    try:
+        _spawn_wait_worker(pending_id, spawn_worker)
+    except Exception:
+        return _overdue_recovery_block(session_id, pending_id)
+    return _in_progress_block(session_id)
+
+
+def _overdue_recovery_block(session_id, pending_id):
+    return {
+        "decision": "block",
+        "reason": _overdue_recovery_text(session_id, pending_id),
+    }
+
+
+def _overdue_recovery_text(session_id, pending_id):
+    confirm_command = _control_command(
+        "confirm",
+        "--pending-id",
+        pending_id,
+    )
+    cancel_command = _control_command(
+        "cancel",
+        "--pending-id",
+        pending_id,
+    )
+    status_command = _control_command(
+        "status",
+        "--session-id",
+        session_id,
+    )
+    return (
+        "The overdue handoff worker could not be restarted; do not continue "
+        "old-thread work here. To transfer explicitly, run "
+        f"{confirm_command}; to remain here, run {cancel_command}; to inspect "
+        f"the durable state, run {status_command}."
+    )
+
+
 def _handle_post_compact(payload, service):
     session_id = payload.get("session_id")
     trigger = payload.get("trigger")
@@ -239,7 +375,7 @@ def _handle_post_compact(payload, service):
     }
 
 
-def _handle_session_start(payload, service):
+def _handle_session_start(payload, service, spawn_worker):
     session_id = payload.get("session_id")
     source = payload.get("source")
     if not isinstance(session_id, str) or not session_id:
@@ -249,6 +385,19 @@ def _handle_session_start(payload, service):
 
     status = service.status(session_id)
     contexts = []
+    if (
+        isinstance(status, dict)
+        and status.get("state") == "armed"
+        and status.get("overdue") is True
+    ):
+        pending_id = status.get("pending_id")
+        if isinstance(pending_id, str) and pending_id:
+            try:
+                _spawn_wait_worker(pending_id, spawn_worker)
+            except Exception:
+                contexts.append(
+                    _overdue_recovery_text(session_id, pending_id)
+                )
     recovery = _failed_recovery_context(status)
     if recovery is not None:
         contexts.append(recovery)
@@ -345,6 +494,27 @@ def _build_service():
     return build_controller_service()
 
 
+def _is_valid_user_prompt(payload):
+    return (
+        isinstance(payload, dict)
+        and payload.get("hook_event_name") == "UserPromptSubmit"
+        and isinstance(payload.get("session_id"), str)
+        and bool(payload.get("session_id"))
+        and isinstance(payload.get("prompt"), str)
+    )
+
+
+def _prompt_failure_block():
+    return {
+        "decision": "block",
+        "reason": (
+            "Project handoff safety checks failed, so this prompt was "
+            "blocked. Inspect the project-handoff Hook and durable state "
+            "before retrying."
+        ),
+    }
+
+
 def main(
     stdin=None,
     stdout=None,
@@ -355,18 +525,42 @@ def main(
     """Read one Hook event and write either one JSON object or nothing."""
     stdin = sys.stdin if stdin is None else stdin
     stdout = sys.stdout if stdout is None else stdout
+    stderr = sys.stderr if stderr is None else stderr
+    try:
+        payload = json.load(stdin)
+    except Exception:
+        stderr.write(_EVENT_FAILURE_DIAGNOSTIC)
+        return 0
+
+    if not isinstance(payload, dict):
+        return 0
+    event_name = payload.get("hook_event_name")
+    if event_name not in {
+        "Stop",
+        "UserPromptSubmit",
+        "PostCompact",
+        "SessionStart",
+    }:
+        return 0
+
+    valid_user_prompt = _is_valid_user_prompt(payload)
     try:
         service = _build_service() if service is None else service
         spawn_worker = (
             subprocess.Popen if spawn_worker is None else spawn_worker
         )
-        payload = json.load(stdin)
         result = handle_event(payload, service, spawn_worker)
         if result is not None:
             json.dump(result, stdout, sort_keys=True)
             stdout.write("\n")
         return 0
     except Exception:
+        if valid_user_prompt:
+            json.dump(_prompt_failure_block(), stdout, sort_keys=True)
+            stdout.write("\n")
+            stderr.write(_PROMPT_FAILURE_DIAGNOSTIC)
+        else:
+            stderr.write(_EVENT_FAILURE_DIAGNOSTIC)
         return 0
 
 

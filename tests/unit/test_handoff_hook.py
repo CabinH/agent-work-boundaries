@@ -202,6 +202,14 @@ class HandoffHookStopAndPromptTests(unittest.TestCase):
             f"<!-- project-handoff:pending={PENDING_ID.upper()} -->",
             "<!-- project-handoff:pending=not-a-uuid -->",
             f"{valid}\n{valid}",
+            f"Example only: {valid}\n{valid}",
+            f"prefix {valid}",
+            f"{valid} suffix",
+            f"> {valid}",
+            f"  {valid}",
+            f"{valid}\ntext after the marker",
+            f"```html\n{valid}\n```",
+            f"```html\n{valid}",
         )
 
         for message in invalid_messages:
@@ -218,6 +226,28 @@ class HandoffHookStopAndPromptTests(unittest.TestCase):
                 self.assertIsNone(result)
                 self.assertEqual(service.arm_calls, [])
                 self.assertEqual(spawner.calls, [])
+
+        for message in (
+            valid,
+            f"Shall I hand this off?\n\n{valid}",
+            f"Shall I hand this off?\n\n{valid}\n \t\n",
+        ):
+            with self.subTest(valid_message=message):
+                service = FakeService()
+                spawner = RecordingSpawner()
+
+                result = handoff_hook.handle_event(
+                    stop_event(message),
+                    service,
+                    spawner,
+                )
+
+                self.assertIsNone(result)
+                self.assertEqual(
+                    service.arm_calls,
+                    [(PENDING_ID, "thr-old", 300)],
+                )
+                self.assertEqual(len(spawner.calls), 1)
 
     def test_stop_does_not_spawn_when_draft_cannot_be_armed(self):
         class UnarmedService(FakeService):
@@ -464,6 +494,115 @@ class HandoffHookStopAndPromptTests(unittest.TestCase):
         self.assertIn("do not continue duplicate work", result["reason"])
         self.assertIn("status", result["reason"])
         self.assertEqual(service.respond_calls, ["thr-old"])
+
+    def test_overdue_prompt_respawns_idempotent_wait_worker_and_stays_blocked(self):
+        class OverdueService(FakeService):
+            def respond(self, session_id):
+                self.respond_calls.append(session_id)
+                return None
+
+        service = OverdueService(
+            {
+                "thr-old": {
+                    "pending_id": PENDING_ID,
+                    "session_id": "thr-old",
+                    "state": "armed",
+                    "overdue": True,
+                }
+            }
+        )
+        spawner = RecordingSpawner()
+
+        result = handoff_hook.handle_event(
+            prompt_event(),
+            service,
+            spawner,
+        )
+
+        self.assertEqual(result["decision"], "block")
+        self.assertEqual(service.respond_calls, ["thr-old"])
+        self.assertEqual(len(spawner.calls), 1)
+        self.assertEqual(
+            spawner.calls[0][0][-3:],
+            ["wait", "--pending-id", PENDING_ID],
+        )
+
+    def test_overdue_prompt_respawn_failure_blocks_with_all_recovery_commands(self):
+        class OverdueService(FakeService):
+            def respond(self, session_id):
+                self.respond_calls.append(session_id)
+                return None
+
+        service = OverdueService(
+            {
+                "thr-old": {
+                    "pending_id": PENDING_ID,
+                    "session_id": "thr-old",
+                    "state": "armed",
+                    "overdue": True,
+                }
+            }
+        )
+
+        result = handoff_hook.handle_event(
+            prompt_event(),
+            service,
+            FailingSpawner(),
+        )
+
+        self.assertEqual(result["decision"], "block")
+        reason = result["reason"]
+        self.assertIn(f"confirm --pending-id {PENDING_ID}", reason)
+        self.assertIn(f"cancel --pending-id {PENDING_ID}", reason)
+        self.assertIn("status --session-id thr-old", reason)
+        self.assertNotIn("private-worker-token", reason)
+
+    def test_task_one_external_phases_always_block_old_thread_work(self):
+        for state in ("thread_starting", "turn_starting", "indeterminate"):
+            with self.subTest(state=state):
+                service = FakeService(
+                    {
+                        "thr-old": {
+                            "pending_id": PENDING_ID,
+                            "session_id": "thr-old",
+                            "state": state,
+                        }
+                    }
+                )
+
+                result = handoff_hook.handle_event(
+                    prompt_event(),
+                    service,
+                    RecordingSpawner(),
+                )
+
+                self.assertEqual(result["decision"], "block")
+                self.assertIn("status --session-id thr-old", result["reason"])
+                self.assertEqual(service.respond_calls, [])
+
+    def test_thread_created_blocks_with_safe_turn_only_resume(self):
+        service = FakeService(
+            {
+                "thr-old": {
+                    "pending_id": PENDING_ID,
+                    "session_id": "thr-old",
+                    "state": "thread_created",
+                    "new_thread_id": "thr-new",
+                }
+            }
+        )
+
+        result = handoff_hook.handle_event(
+            prompt_event(),
+            service,
+            RecordingSpawner(),
+        )
+
+        self.assertEqual(result["decision"], "block")
+        self.assertIn(f"confirm --pending-id {PENDING_ID}", result["reason"])
+        self.assertIn("resume only", result["reason"])
+        self.assertIn("status --session-id thr-old", result["reason"])
+        self.assertEqual(service.respond_calls, [])
 
     def test_user_prompt_race_reports_destination_when_transfer_finishes(self):
         class FinishedRaceService(FakeService):
@@ -717,6 +856,56 @@ class HandoffHookCompactionTests(unittest.TestCase):
                 context = self.context_from(result)
                 self.assertIn("handoff transfer failed", context)
                 self.assertIn(recovery, context)
+
+    def test_session_start_respawns_overdue_idempotent_wait_worker(self):
+        service = FakeService(
+            {
+                "thr-old": {
+                    "pending_id": PENDING_ID,
+                    "session_id": "thr-old",
+                    "state": "armed",
+                    "overdue": True,
+                }
+            }
+        )
+        spawner = RecordingSpawner()
+
+        result = handoff_hook.handle_event(
+            session_start_event("resume"),
+            service,
+            spawner,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(len(spawner.calls), 1)
+        self.assertEqual(
+            spawner.calls[0][0][-3:],
+            ["wait", "--pending-id", PENDING_ID],
+        )
+
+    def test_session_start_overdue_respawn_failure_adds_recovery_context(self):
+        service = FakeService(
+            {
+                "thr-old": {
+                    "pending_id": PENDING_ID,
+                    "session_id": "thr-old",
+                    "state": "armed",
+                    "overdue": True,
+                }
+            }
+        )
+
+        result = handoff_hook.handle_event(
+            session_start_event("resume"),
+            service,
+            FailingSpawner(),
+        )
+
+        context = self.context_from(result)
+        self.assertIn(f"confirm --pending-id {PENDING_ID}", context)
+        self.assertIn(f"cancel --pending-id {PENDING_ID}", context)
+        self.assertIn("status --session-id thr-old", context)
+        self.assertNotIn("private-worker-token", context)
 
     def test_failed_transfer_context_stays_below_word_limit(self):
         service = FakeService(
@@ -1037,14 +1226,17 @@ class HandoffHookSafetyAndMainTests(unittest.TestCase):
 
     def test_main_emits_nothing_for_malformed_or_unknown_input(self):
         inputs = (
-            "not json",
-            "[]",
-            json.dumps(
-                {"hook_event_name": "Unknown", "session_id": "thr-old"}
+            ("not json", "project-handoff-hook-error:event\n"),
+            ("[]", ""),
+            (
+                json.dumps(
+                    {"hook_event_name": "Unknown", "session_id": "thr-old"}
+                ),
+                "",
             ),
         )
 
-        for hook_input in inputs:
+        for hook_input, expected_stderr in inputs:
             with self.subTest(hook_input=hook_input):
                 service = FakeService()
                 stdout = io.StringIO()
@@ -1060,7 +1252,7 @@ class HandoffHookSafetyAndMainTests(unittest.TestCase):
 
                 self.assertEqual(code, 0)
                 self.assertEqual(stdout.getvalue(), "")
-                self.assertEqual(stderr.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), expected_stderr)
                 self.assertEqual(service.arm_calls, [])
                 self.assertEqual(service.respond_calls, [])
                 self.assertEqual(service.store.compaction_counts, {})
@@ -1083,7 +1275,10 @@ class HandoffHookSafetyAndMainTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(stdout.getvalue(), "")
-        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(
+            stderr.getvalue(),
+            "project-handoff-hook-error:event\n",
+        )
 
     def test_main_contains_service_construction_failure(self):
         stdout = io.StringIO()
@@ -1103,7 +1298,103 @@ class HandoffHookSafetyAndMainTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(stdout.getvalue(), "")
-        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(
+            stderr.getvalue(),
+            "project-handoff-hook-error:event\n",
+        )
+
+    def test_main_parses_input_before_constructing_service(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with mock.patch.object(handoff_hook, "_build_service") as build_service:
+            code = handoff_hook.main(
+                stdin=io.StringIO("not-json"),
+                stdout=stdout,
+                stderr=stderr,
+                spawn_worker=RecordingSpawner(),
+            )
+
+        self.assertEqual(code, 0)
+        build_service.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "project-handoff-hook-error:event\n")
+
+    def test_valid_user_prompt_fails_closed_for_service_construction_error(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with mock.patch.object(
+            handoff_hook,
+            "_build_service",
+            side_effect=RuntimeError("/private/path Bearer secret-value"),
+        ):
+            code = handoff_hook.main(
+                stdin=io.StringIO(json.dumps(prompt_event("private prompt"))),
+                stdout=stdout,
+                stderr=stderr,
+                spawn_worker=RecordingSpawner(),
+            )
+
+        self.assertEqual(code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output["decision"], "block")
+        combined = stdout.getvalue() + stderr.getvalue()
+        for secret in ("/private/path", "secret-value", "private prompt"):
+            self.assertNotIn(secret, combined)
+        self.assertEqual(
+            stderr.getvalue(),
+            "project-handoff-hook-error:user-prompt-submit\n",
+        )
+
+    def test_valid_user_prompt_fails_closed_for_state_and_persistence_errors(self):
+        class StatusFailure(FakeService):
+            def status(self, session_id):
+                raise json.JSONDecodeError("private corrupt state", "secret", 0)
+
+        class PersistenceFailure(FakeService):
+            def __init__(self):
+                super().__init__(
+                    {
+                        "thr-old": {
+                            "pending_id": PENDING_ID,
+                            "session_id": "thr-old",
+                            "state": "armed",
+                        }
+                    }
+                )
+
+            def respond(self, session_id):
+                raise OSError("/private/state.json could not persist secret")
+
+        for service in (StatusFailure(), PersistenceFailure()):
+            with self.subTest(service=type(service).__name__):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+
+                code = handoff_hook.main(
+                    stdin=io.StringIO(json.dumps(prompt_event("private prompt"))),
+                    stdout=stdout,
+                    stderr=stderr,
+                    service=service,
+                    spawn_worker=RecordingSpawner(),
+                )
+
+                self.assertEqual(code, 0)
+                output = json.loads(stdout.getvalue())
+                self.assertEqual(output["decision"], "block")
+                combined = stdout.getvalue() + stderr.getvalue()
+                for secret in (
+                    "private corrupt state",
+                    "/private/state.json",
+                    "secret",
+                    "private prompt",
+                ):
+                    self.assertNotIn(secret, combined)
+                self.assertEqual(
+                    stderr.getvalue(),
+                    "project-handoff-hook-error:user-prompt-submit\n",
+                )
 
 
 if __name__ == "__main__":

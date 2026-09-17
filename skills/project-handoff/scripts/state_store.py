@@ -90,7 +90,19 @@ class StateStore:
             self._set_state(record, "armed")
             record["session_id"] = session_id
             record["deadline_at"] = self.now() + timeout_seconds
-            self._persist(record)
+            session_path = self._session_path(session_id)
+            with self._session_locked(session_id):
+                cached = (
+                    self._read_record(session_path)
+                    if session_path.exists()
+                    else None
+                )
+                record["generation"] = (
+                    self._max_session_generation(session_id, cached) + 1
+                )
+                self._copy_compaction_metadata(cached, record)
+                self._write_record(self._pending_path(pending_id), record)
+                self._write_record(session_path, record)
             return record
 
     def respond(self, session_id: str) -> dict[str, object] | None:
@@ -332,13 +344,14 @@ class StateStore:
         for pending_path in self.pending_dir.glob("*.json"):
             pending_id = pending_path.stem
             try:
-                with self._locked(pending_id):
-                    if pending_path.exists():
-                        record = self._read_record(pending_path)
-                        if record.get("session_id") == session_id:
-                            candidates.append(record)
+                self._validate_pending_id(pending_id)
             except ValueError:
                 continue
+            with self._locked(pending_id):
+                if pending_path.exists():
+                    record = self._read_record(pending_path)
+                    if record.get("session_id") == session_id:
+                        candidates.append(record)
         if not candidates:
             return cached
 
@@ -376,15 +389,48 @@ class StateStore:
         if isinstance(session_id, str):
             session_path = self._session_path(session_id)
             with self._session_locked(session_id):
-                if session_path.exists():
-                    session_record = self._read_record(session_path)
-                    for key in ("compaction_count", "compaction_sources"):
-                        if key in session_record:
-                            record[key] = session_record[key]
+                session_record = (
+                    self._read_record(session_path)
+                    if session_path.exists()
+                    else None
+                )
+                self._copy_compaction_metadata(session_record, record)
                 self._write_record(self._pending_path(str(record["pending_id"])), record)
-                self._write_record(session_path, record)
+                if (
+                    session_record is None
+                    or self._session_record_rank(record)
+                    >= self._session_record_rank(session_record)
+                ):
+                    self._write_record(session_path, record)
             return
         self._write_record(self._pending_path(str(record["pending_id"])), record)
+
+    def _max_session_generation(
+        self,
+        session_id: str,
+        cached: dict[str, object] | None,
+    ) -> int:
+        maximum = self._record_generation(cached)
+        for pending_path in self.pending_dir.glob("*.json"):
+            try:
+                self._validate_pending_id(pending_path.stem)
+            except ValueError:
+                continue
+            candidate = self._read_record(pending_path)
+            if candidate.get("session_id") == session_id:
+                maximum = max(maximum, self._record_generation(candidate))
+        return maximum
+
+    @staticmethod
+    def _copy_compaction_metadata(
+        source: dict[str, object] | None,
+        destination: dict[str, object],
+    ) -> None:
+        if source is None:
+            return
+        for key in ("compaction_count", "compaction_sources"):
+            if key in source:
+                destination[key] = source[key]
 
     @staticmethod
     def _set_state(record: dict[str, object], new_state: str) -> None:
@@ -419,13 +465,21 @@ class StateStore:
         record["request_history"] = history[-_REQUEST_HISTORY_LIMIT:]
 
     @staticmethod
-    def _session_record_rank(record: dict[str, object]) -> tuple[bool, float, str]:
-        active = record.get("state") not in {"transferred", "cancelled"}
+    def _session_record_rank(record: dict[str, object]) -> tuple[int, float, str]:
         return (
-            active,
+            StateStore._record_generation(record),
             float(record.get("created_at", 0.0)),
-            str(record["pending_id"]),
+            str(record.get("pending_id", "")),
         )
+
+    @staticmethod
+    def _record_generation(record: dict[str, object] | None) -> int:
+        if record is None:
+            return 0
+        generation = record.get("generation", 0)
+        if isinstance(generation, int) and not isinstance(generation, bool):
+            return max(generation, 0)
+        return 0
 
     @staticmethod
     def _validate_pending_id(pending_id: str) -> None:

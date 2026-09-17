@@ -97,7 +97,14 @@ class HandoffService:
             return None
         status = dict(record)
         state = str(status.get("state"))
-        if state == "failed":
+        if state == "armed":
+            deadline = status.get("deadline_at")
+            if isinstance(deadline, (int, float)) and not isinstance(
+                deadline,
+                bool,
+            ):
+                status["overdue"] = float(self.store.now()) >= float(deadline)
+        elif state == "failed":
             status.update(
                 retryable=True,
                 recovery_mode="retry_full_transfer",

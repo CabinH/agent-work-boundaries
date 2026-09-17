@@ -374,6 +374,23 @@ class HandoffServiceTests(unittest.TestCase):
         self.assertFalse(target.exists())
         self.assertEqual(client.calls, [])
 
+    def test_status_marks_only_deadline_passed_armed_record_overdue(self):
+        clock = FakeClock()
+        service, _client, _clock = self.make_service(clock=clock)
+        pending_id, _target = self.prepare_armed(service)
+
+        before_deadline = service.status("thr-old")
+        clock.value = 400.0
+        at_deadline = service.status("thr-old")
+        service.cancel(pending_id)
+        after_response = service.status("thr-old")
+
+        self.assertFalse(before_deadline["overdue"])
+        self.assertTrue(at_deadline["overdue"])
+        self.assertNotIn("overdue", after_response)
+        self.assertEqual(after_response["state"], "cancelled")
+        self.assertEqual(after_response["pending_id"], pending_id)
+
     def test_wait_transfers_after_deadline(self):
         service, client, clock = self.make_service()
         pending_id, target = self.prepare_armed(service)

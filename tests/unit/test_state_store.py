@@ -162,6 +162,91 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(self.read_pending(record["pending_id"]), claimed)
         self.assertEqual(self.read_session("thr-old"), claimed)
 
+    def test_session_lookup_does_not_hide_corrupt_pending_json(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+        record = store.prepare("/repo", "handoff", "/repo/AI-HANDOFF.md")
+        store.arm(record["pending_id"], "thr-old", 300)
+        pending_path = self.root / "pending" / f"{record['pending_id']}.json"
+        pending_path.write_text("{ corrupt private state")
+
+        with self.assertRaises(json.JSONDecodeError):
+            store.get_session_status("thr-old")
+
+    def test_newest_session_generation_wins_even_when_older_record_is_active(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+        store.record_compaction("thr-old", "auto")
+        older = store.prepare("/repo", "old", "/repo/old.md")
+        older_armed = store.arm(older["pending_id"], "thr-old", 300)
+        store.claim_confirm(older["pending_id"])
+        store.mark_failed(
+            older["pending_id"],
+            error_summary="older retryable failure",
+            recovery_prompt="retry old",
+        )
+
+        newer = store.prepare("/repo", "new", "/repo/new.md")
+        newer_armed = store.arm(newer["pending_id"], "thr-old", 300)
+        store.claim_confirm(newer["pending_id"])
+        store.mark_thread_starting(newer["pending_id"], "resume new")
+        store.mark_thread_created(newer["pending_id"], "thr-new")
+        store.mark_turn_starting(
+            newer["pending_id"],
+            f"project-handoff:{newer['pending_id']}",
+        )
+        store.mark_transferred(newer["pending_id"], "thr-new")
+
+        status = store.get_session_status("thr-old")
+
+        self.assertEqual(older_armed["generation"], 1)
+        self.assertEqual(newer_armed["generation"], 2)
+        self.assertEqual(status["pending_id"], newer["pending_id"])
+        self.assertEqual(status["state"], "transferred")
+        self.assertEqual(status["generation"], 2)
+        self.assertEqual(status["compaction_count"], 1)
+        self.assertEqual(status["compaction_sources"], {"auto": 1})
+
+    def test_cache_rebuild_keeps_compaction_metadata_on_newest_generation(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+        first = store.prepare("/repo", "first", "/repo/first.md")
+        store.arm(first["pending_id"], "thr-old", 300)
+        second = store.prepare("/repo", "second", "/repo/second.md")
+        store.arm(second["pending_id"], "thr-old", 300)
+        stale = self.read_pending(first["pending_id"])
+        stale["compaction_count"] = 3
+        stale["compaction_sources"] = {"auto": 2, "manual": 1}
+        session_name = hashlib.sha256(b"thr-old").hexdigest()
+        session_path = self.root / "sessions" / f"{session_name}.json"
+        session_path.write_text(json.dumps(stale))
+
+        rebuilt = store.get_session_status("thr-old")
+
+        self.assertEqual(rebuilt["pending_id"], second["pending_id"])
+        self.assertEqual(rebuilt["generation"], 2)
+        self.assertEqual(rebuilt["compaction_count"], 3)
+        self.assertEqual(
+            rebuilt["compaction_sources"],
+            {"auto": 2, "manual": 1},
+        )
+        self.assertEqual(self.read_session("thr-old"), rebuilt)
+
+    def test_concurrent_arms_assign_distinct_monotonic_generations(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+        first = store.prepare("/repo", "first", "/repo/first.md")
+        second = store.prepare("/repo", "second", "/repo/second.md")
+
+        armed = self.run_race(
+            lambda: store.arm(first["pending_id"], "thr-old", 300),
+            lambda: store.arm(second["pending_id"], "thr-old", 300),
+        )
+
+        self.assertEqual({record["generation"] for record in armed}, {1, 2})
+        status = store.get_session_status("thr-old")
+        self.assertEqual(status["generation"], 2)
+        generation_two = next(
+            record for record in armed if record["generation"] == 2
+        )
+        self.assertEqual(status["pending_id"], generation_two["pending_id"])
+
     def test_expiry_wins_against_late_response(self):
         clock = [100.0]
         store = StateStore(self.root, now=lambda: clock[0])
