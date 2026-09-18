@@ -33,6 +33,8 @@ Keep the draft at 80 lines or fewer. One terminal newline closes the last line; 
 - `# Verification Status`
 - `# Next Step` containing exactly one next step
 
+When preparing, pass `--conversation-language` with the user's latest explicit language preference, or otherwise the language used to communicate with the user in this conversation (not the language of code, quotations, or the handoff headings). If unclear, use `中文`. The continuation preserves this preference unless the user requests otherwise; older records without a language default to Chinese.
+
 Run `prepare`, ask whether to transfer, and end the request with exactly one marker:
 
 `<!-- project-handoff:pending=<pending_id> -->`

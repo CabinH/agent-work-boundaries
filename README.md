@@ -39,6 +39,12 @@ line. A transfer has one durable local claimant and at most one automatic send
 attempt per external phase. This does not promise external exactly-once
 creation: possibly sent requests stop for inspection and are not retried.
 
+Each transfer has its own private handoff snapshot. New threads read that
+snapshot, while `docs/AI-HANDOFF.md` remains the project's latest copy.
+The preparing Agent passes the source conversation's communication language
+with `prepare --conversation-language`; continuation preserves it unless the
+user requests otherwise. Omitted language and older records default to Chinese.
+
 The Task Router's ChatGPT route is manual in version 1. Its template carries
 goal, inputs/files, allowed changes, forbidden content, expected format,
 verification, and stop condition; it requests conclusion, evidence locations,
@@ -84,6 +90,11 @@ current Codex UI may not focus it automatically. Use the reported, copyable
 
 Recovery depends on the reported state:
 
+- `transferring` may be an abandoned pre-send claim. When `status` reports a
+  `recovery_command`, running it checks the worker lock and changes an abandoned
+  claim to `failed` without sending a request. It leaves live workers and later
+  phases unchanged. Check status again before following the `failed` rules;
+  legacy claims without a worker-lock marker require manual inspection.
 - `failed` is retryable only because no external request may have been sent;
   after explicit approval, `confirm` retries the full transfer.
 - `thread_created` has a durable destination; after explicit approval,

@@ -46,11 +46,20 @@ class HandoffService:
         self.private_handoff_dir = Path(private_handoff_dir)
         self.sleeper = sleeper
 
-    def prepare(self, cwd, handoff_text, target_path):
+    def prepare(self, cwd, handoff_text, target_path, conversation_language="中文"):
         self._validate_handoff(handoff_text)
+        if (
+            not isinstance(conversation_language, str)
+            or not conversation_language.strip()
+            or len(conversation_language) > 80
+            or any(ord(char) < 32 for char in conversation_language)
+        ):
+            raise HandoffValidationError("invalid conversation language")
         cwd = Path(cwd).resolve()
         self._resolve_target(cwd, target_path)
-        record = self.store.prepare(str(cwd), handoff_text, str(target_path))
+        record = self.store.prepare(
+            str(cwd), handoff_text, str(target_path), conversation_language.strip(),
+        )
         return str(record["pending_id"])
 
     def arm(self, pending_id, session_id, timeout_seconds=300):
@@ -65,10 +74,11 @@ class HandoffService:
         return self.store.respond(session_id)
 
     def confirm(self, pending_id):
-        record = self._store_call(self.store.claim_confirm, pending_id)
-        if record is None:
-            return None
-        return self._transfer_claimed(record)
+        with self._store_call(self.store.worker_locked, pending_id):
+            record = self._store_call(self.store.claim_confirm, pending_id, True)
+            if record is None:
+                return None
+            return self._transfer_claimed(record)
 
     def cancel(self, pending_id):
         return self._store_call(self.store.cancel, pending_id)
@@ -84,14 +94,39 @@ class HandoffService:
             if remaining > 0:
                 self.sleeper(remaining)
                 continue
-            claimed = self.store.claim_expired(pending_id)
+            with self.store.worker_locked(pending_id):
+                claimed = self.store.claim_expired(pending_id, True)
+                if claimed is not None:
+                    return self._transfer_claimed(claimed)
             if claimed is None:
                 current = self._pending_record(pending_id)
                 if current["state"] != "armed":
                     return None
                 self.sleeper(_CLAIM_RETRY_DELAY_SECONDS)
                 continue
-            return self._transfer_claimed(claimed)
+
+    def recover(self, pending_id):
+        """Explicitly release a dead, guarded worker's definitely-unsent claim."""
+        lock = self._store_call(
+            lambda value: self.store.worker_locked(value, blocking=False), pending_id,
+        )
+        try:
+            lock.__enter__()
+        except BlockingIOError:
+            return None
+        try:
+            record = self._pending_record(pending_id)
+            if (
+                record["state"] != "transferring"
+                or record.get("worker_guarded") is not True
+            ):
+                return None
+            prompt = self._recovery_prompt_after_failure(record, None)
+            return self.store.mark_failed(
+                pending_id, "Worker exited before any external request", prompt,
+            )
+        finally:
+            lock.__exit__(None, None, None)
 
     def status(self, session_id):
         record = self.store.get_session_status(session_id)
@@ -106,6 +141,18 @@ class HandoffService:
                 bool,
             ):
                 status["overdue"] = float(self.store.now()) >= float(deadline)
+        elif state == "transferring":
+            status.update(
+                retryable=False,
+                recovery_mode="inspect_worker",
+                inspection_required=True,
+            )
+            if status.get("worker_guarded") is True:
+                status["recovery_command"] = shlex.join([
+                    sys.executable,
+                    str(Path(__file__).with_name("handoffctl.py").resolve()),
+                    "recover", "--pending-id", str(status["pending_id"]),
+                ])
         elif state == "failed":
             status.update(
                 retryable=True,
@@ -440,15 +487,15 @@ class HandoffService:
         return target
 
     def _publish_with_fallback(self, pending_id, cwd, target, handoff_text):
+        snapshot = self._private_target(pending_id)
+        self._publish_private(snapshot, handoff_text)
         try:
             self._publish_project(cwd, target, handoff_text)
-            return target
         except PublicationRollbackError:
             raise
         except OSError:
-            fallback = self._private_target(pending_id)
-            self._publish_private(fallback, handoff_text)
-            return fallback
+            pass
+        return snapshot
 
     def _private_target(self, pending_id):
         return self.private_handoff_dir / f"{pending_id}.md"
@@ -656,6 +703,11 @@ class HandoffService:
                 os.fsync(handle.fileno())
             os.replace(temporary_path, target)
             temporary_path = None
+            directory_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
@@ -666,6 +718,13 @@ class HandoffService:
 
     @staticmethod
     def _format_resume_prompt(record, handoff_path):
+        language = record.get("conversation_language") or "中文"
+        language_instruction = (
+            "默认使用中文与用户沟通，除非用户另有要求。"
+            if language == "中文" else
+            f"Communicate with the user in {language}, as in the source conversation, "
+            "unless the user requests otherwise."
+        )
         return (
             "This thread continues work handed off from "
             f"{record['session_id']}.\n"
@@ -673,6 +732,7 @@ class HandoffService:
             "source-of-truth files before trusting the summary.\n"
             "Continue from the single “Next Step” in the handoff. Do not redo "
             "completed work. Report any contradiction before changing files."
+            f"\n{language_instruction}"
         )
 
     @staticmethod

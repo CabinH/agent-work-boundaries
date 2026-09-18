@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -10,6 +11,7 @@ import os
 from pathlib import Path
 import tempfile
 import uuid
+import warnings
 
 
 LEGAL_TRANSITIONS = {
@@ -60,6 +62,7 @@ class StateStore:
         self.sessions_dir = self.root / "sessions"
         self.session_metadata_dir = self.root / "session-metadata"
         self.locks_dir = self.root / "locks"
+        self.memberships_dir = self.root / "session-pending"
         self.prepare_sequence_path = self.root / "prepare-sequence.json"
         for directory in (
             self.root,
@@ -67,6 +70,7 @@ class StateStore:
             self.sessions_dir,
             self.session_metadata_dir,
             self.locks_dir,
+            self.memberships_dir,
         ):
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             directory.chmod(0o700)
@@ -76,6 +80,7 @@ class StateStore:
         cwd: str,
         handoff_text: str,
         target_path: str,
+        conversation_language: str = "中文",
     ) -> dict[str, object]:
         pending_id = str(uuid.uuid4())
         prepare_sequence = self._allocate_prepare_sequence()
@@ -85,6 +90,7 @@ class StateStore:
             "state": "draft",
             "cwd": cwd,
             "handoff_text": handoff_text,
+            "conversation_language": conversation_language,
             "target_path": target_path,
             "created_at": self.now(),
         }
@@ -102,6 +108,11 @@ class StateStore:
             raise ValueError("timeout_seconds must be exactly 300")
         with self._authority_locked(session_id):
             authoritative = self._authoritative_session_record_locked(session_id)
+            if authoritative is not None and authoritative.get("state") in {
+                "transferring", "expired", "thread_starting", "thread_created",
+                "turn_starting", "indeterminate", "transferred",
+            }:
+                return None
             metadata = self._load_session_metadata_locked(
                 session_id,
                 authoritative,
@@ -123,6 +134,7 @@ class StateStore:
                         record,
                     )
                     return None
+                self._register_session_pending(session_id, pending_id)
                 record["generation"] = self._record_generation(authoritative) + 1
                 self._copy_session_metadata(metadata, record)
                 self._write_record(self._pending_path(pending_id), record)
@@ -176,7 +188,9 @@ class StateStore:
                         )
                         return self._prompt_fence_proof(record, result)
 
-    def claim_confirm(self, pending_id: str) -> dict[str, object] | None:
+    def claim_confirm(
+        self, pending_id: str, worker_guarded: bool = False,
+    ) -> dict[str, object] | None:
         initial = self._read_record(self._pending_path(pending_id))
         session_id = initial.get("session_id")
         if not isinstance(session_id, str):
@@ -197,6 +211,7 @@ class StateStore:
                 if record["state"] not in {"armed", "responded", "failed"}:
                     return None
                 self._set_state(record, "transferring")
+                record["worker_guarded"] = worker_guarded
                 record["claim_reason"] = "confirmed"
                 record["transferring_at"] = self.now()
                 self._copy_session_metadata(metadata, record)
@@ -205,7 +220,9 @@ class StateStore:
                     self._write_record(self._session_path(session_id), record)
                 return record
 
-    def claim_expired(self, pending_id: str) -> dict[str, object] | None:
+    def claim_expired(
+        self, pending_id: str, worker_guarded: bool = False,
+    ) -> dict[str, object] | None:
         initial = self._read_record(self._pending_path(pending_id))
         session_id = initial.get("session_id")
         if not isinstance(session_id, str):
@@ -240,6 +257,7 @@ class StateStore:
                 self._set_state(record, "expired")
                 record["expired_at"] = timestamp
                 self._set_state(record, "transferring")
+                record["worker_guarded"] = worker_guarded
                 record["claim_reason"] = "expired"
                 record["transferring_at"] = timestamp
                 self._copy_session_metadata(metadata, record)
@@ -253,9 +271,8 @@ class StateStore:
         pending_id: str,
         recovery_prompt: str,
     ) -> dict[str, object] | None:
-        with self._locked(pending_id):
-            record = self._read_record(self._pending_path(pending_id))
-            if record["state"] != "transferring":
+        with self._authoritative_pending_locked(pending_id) as record:
+            if record is None or record["state"] != "transferring":
                 return None
             self._set_state(record, "thread_starting")
             self._clear_attempt_diagnostics(record)
@@ -284,9 +301,8 @@ class StateStore:
         pending_id: str,
         client_user_message_id: str,
     ) -> dict[str, object] | None:
-        with self._locked(pending_id):
-            record = self._read_record(self._pending_path(pending_id))
-            if record["state"] != "thread_created":
+        with self._authoritative_pending_locked(pending_id) as record:
+            if record is None or record["state"] != "thread_created":
                 return None
             self._set_state(record, "turn_starting")
             self._clear_attempt_diagnostics(record)
@@ -481,6 +497,22 @@ class StateStore:
         session_id: str,
     ) -> list[dict[str, object]]:
         candidates: list[dict[str, object]] = []
+        membership_path = self._membership_path(session_id)
+        known = set(
+            self._read_record(membership_path).get("pending_ids", [])
+            if membership_path.exists() else []
+        )
+        # Legacy installations may only have the session cache as ownership proof.
+        cached_path = self._session_path(session_id)
+        if cached_path.exists():
+            try:
+                cached_id = self._read_record(cached_path).get("pending_id")
+            except (ValueError, UnicodeError, AttributeError):
+                if not known:
+                    raise
+                cached_id = None
+            if cached_id:
+                known.add(cached_id)
         for pending_path in self.pending_dir.glob("*.json"):
             pending_id = pending_path.stem
             try:
@@ -489,10 +521,55 @@ class StateStore:
                 continue
             with self._locked(pending_id):
                 if pending_path.exists():
-                    record = self._read_record(pending_path)
+                    try:
+                        record = self._read_record(pending_path)
+                        if not isinstance(record, dict):
+                            raise ValueError("invalid pending record")
+                    except (ValueError, UnicodeError):
+                        if pending_id in known:
+                            raise
+                        warnings.warn(
+                            f"Unreadable pending record outside this session {pending_id}; "
+                            "inspect project-handoff state manually.",
+                            RuntimeWarning,
+                        )
+                        continue
                     if record.get("session_id") == session_id:
                         candidates.append(record)
+                        if pending_id not in known:
+                            self._register_session_pending(session_id, pending_id)
+                            known.add(pending_id)
         return candidates
+
+    @contextmanager
+    def _authoritative_pending_locked(self, pending_id: str):
+        initial = self._read_record(self._pending_path(pending_id))
+        session_id = str(initial["session_id"])
+        with self._authority_locked(session_id):
+            authoritative = self._authoritative_session_record_locked(session_id)
+            with self._locked(pending_id):
+                record = self._read_record(self._pending_path(pending_id))
+                if self._same_bound_generation(record, authoritative):
+                    yield record
+                else:
+                    yield None
+
+    def _membership_path(self, session_id: str) -> Path:
+        return self.memberships_dir / self._session_path(session_id).name
+
+    def _register_session_pending(self, session_id: str, pending_id: str) -> None:
+        # Persist ownership before binding the pending record or updating its cache.
+        path = self._membership_path(session_id)
+        membership = self._read_record(path) if path.exists() else {"pending_ids": []}
+        if pending_id not in membership["pending_ids"]:
+            membership["pending_ids"].append(pending_id)
+            self._write_record(path, membership)
+
+    def worker_locked(self, pending_id: str, *, blocking=True):
+        self._validate_pending_id(pending_id)
+        return _RecordLock(
+            self.locks_dir / f"worker-{pending_id}.lock", blocking=blocking,
+        )
 
     def _pending_path(self, pending_id: str) -> Path:
         self._validate_pending_id(pending_id)
@@ -663,17 +740,28 @@ class StateStore:
 
     def _latest_prepare_sequence_locked(self) -> int:
         sequence = 0
+        has_durable_sequence = False
         if self.prepare_sequence_path.exists():
             metadata = self._read_record(self.prepare_sequence_path)
             value = metadata.get("latest_prepare_sequence", 0)
             if isinstance(value, int) and not isinstance(value, bool):
                 sequence = max(sequence, value)
+                has_durable_sequence = True
         for pending_path in self.pending_dir.glob("*.json"):
             try:
                 self._validate_pending_id(pending_path.stem)
             except ValueError:
                 continue
-            record = self._read_record(pending_path)
+            try:
+                record = self._read_record(pending_path)
+                if not isinstance(record, dict):
+                    raise ValueError("invalid pending record")
+            except (ValueError, UnicodeError):
+                # Allocation durably advances the sequence before publishing a
+                # draft. A damaged draft must not block unrelated user prompts.
+                if not has_durable_sequence:
+                    raise
+                continue
             value = record.get("prepare_sequence", 0)
             if isinstance(value, int) and not isinstance(value, bool):
                 sequence = max(sequence, value)
@@ -854,14 +942,23 @@ class StateStore:
 
 
 class _RecordLock:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, blocking=True):
         self.path = path
+        self.blocking = blocking
         self._handle = None
 
     def __enter__(self):
         descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
         self._handle = os.fdopen(descriptor, "a+")
-        fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
+        try:
+            fcntl.flock(
+                self._handle.fileno(),
+                fcntl.LOCK_EX | (0 if self.blocking else fcntl.LOCK_NB),
+            )
+        except BaseException:
+            self._handle.close()
+            self._handle = None
+            raise
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):

@@ -366,6 +366,16 @@ with tempfile.TemporaryDirectory() as temporary:
         self.assertEqual(self.read_pending(record["pending_id"]), claimed)
         self.assertEqual(self.read_session("thr-old"), claimed)
 
+    def test_corrupt_session_cache_is_rebuilt_from_durable_ownership(self):
+        store = StateStore(self.root, now=lambda: 100.0)
+        record = store.prepare("/repo", "handoff", "/repo/AI-HANDOFF.md")
+        store.arm(record["pending_id"], "thr-old", 300)
+        store.respond("thr-old")
+        store._session_path("thr-old").write_text("{broken")
+        recovered = store.get_session_status("thr-old")
+        self.assertEqual(recovered["state"], "responded")
+        self.assertEqual(self.read_session("thr-old"), recovered)
+
     def test_session_lookup_does_not_hide_corrupt_pending_json(self):
         store = StateStore(self.root, now=lambda: 100.0)
         record = store.prepare("/repo", "handoff", "/repo/AI-HANDOFF.md")
@@ -742,9 +752,14 @@ with tempfile.TemporaryDirectory() as temporary:
 
                 old_claims = [result for result in results[:2] if result]
                 self.assertLessEqual(len(old_claims), 1)
-                self.assertIsNotNone(results[2])
-                self.assertEqual(status["pending_id"], newer["pending_id"])
-                self.assertEqual(status["state"], "armed")
+                if old_claims:
+                    self.assertIsNone(results[2])
+                    self.assertEqual(status["pending_id"], older["pending_id"])
+                    self.assertEqual(status["state"], "transferring")
+                else:
+                    self.assertIsNotNone(results[2])
+                    self.assertEqual(status["pending_id"], newer["pending_id"])
+                    self.assertEqual(status["state"], "armed")
 
     def test_respond_fences_prepared_arm_waiting_on_authority_window(self):
         store = StateStore(self.root, now=lambda: 100.0)

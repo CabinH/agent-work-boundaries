@@ -56,6 +56,7 @@ def _parser():
     prepare.add_argument("--cwd", required=True)
     prepare.add_argument("--from-file", required=True)
     prepare.add_argument("--target", required=True)
+    prepare.add_argument("--conversation-language", default="中文")
 
     arm = commands.add_parser("arm")
     arm.add_argument("--pending-id", required=True)
@@ -65,7 +66,7 @@ def _parser():
     respond = commands.add_parser("respond")
     respond.add_argument("--session-id", required=True)
 
-    for name in ("confirm", "cancel", "wait"):
+    for name in ("confirm", "cancel", "wait", "recover"):
         command = commands.add_parser(name)
         command.add_argument("--pending-id", required=True)
 
@@ -107,6 +108,7 @@ def _run(args, service, stdin):
             args.cwd,
             _read_draft(args.from_file, stdin),
             args.target,
+            args.conversation_language,
         )
         return {"pending_id": pending_id}
     if args.command == "arm":
@@ -119,6 +121,8 @@ def _run(args, service, stdin):
         return service.respond(args.session_id)
     if args.command == "confirm":
         return service.confirm(args.pending_id)
+    if args.command == "recover":
+        return service.recover(args.pending_id)
     if args.command == "cancel":
         return service.cancel(args.pending_id)
     if args.command == "wait":

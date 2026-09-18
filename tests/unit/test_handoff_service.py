@@ -576,9 +576,11 @@ class HandoffServiceTests(unittest.TestCase):
         clock.value = 400.0
         original_claim_expired = service.store.claim_expired
 
-        def confirm_then_decline_expiry(claimed_pending_id):
-            service.confirm(claimed_pending_id)
-            return original_claim_expired(claimed_pending_id)
+        def confirm_then_decline_expiry(claimed_pending_id, worker_guarded=False):
+            # The expiry caller already holds the worker lock in this test.
+            claimed = service.store.claim_confirm(claimed_pending_id, worker_guarded)
+            service._transfer_claimed(claimed)
+            return original_claim_expired(claimed_pending_id, worker_guarded)
 
         with mock.patch.object(
             service.store,
@@ -656,7 +658,7 @@ class HandoffServiceTests(unittest.TestCase):
         status = service.status("thr-old")
         self.assertEqual(status["state"], "failed")
         self.assertLessEqual(len(status["error_summary"]), 512)
-        self.assertIn(str(target), status["recovery_prompt"])
+        self.assertIn(str(service._private_target(pending_id)), status["recovery_prompt"])
         self.assertEqual(status["recovery_mode"], "retry_full_transfer")
         self.assertTrue(status["retryable"])
         self.assertEqual(target.read_text(), VALID_HANDOFF)
@@ -675,7 +677,7 @@ class HandoffServiceTests(unittest.TestCase):
         self.assertEqual(status["external_phase"], "thread_starting")
         self.assertFalse(status["retryable"])
         self.assertEqual(status["recovery_mode"], "inspect_external_outcome")
-        self.assertIn(str(target), status["recovery_prompt"])
+        self.assertIn(str(service._private_target(pending_id)), status["recovery_prompt"])
         self.assertIsNone(service.confirm(pending_id))
         self.assertEqual(client.thread_calls, [str(self.root)])
         self.assertEqual(client.turn_calls, [])
@@ -944,7 +946,7 @@ class HandoffServiceTests(unittest.TestCase):
         status = service.status("thr-old")
         self.assertEqual(status["state"], "failed")
         self.assertIn("worker failed unexpectedly", status["error_summary"])
-        self.assertIn(str(target), status["recovery_prompt"])
+        self.assertIn(str(service._private_target(pending_id)), status["recovery_prompt"])
         self.assertEqual(target.read_text(), VALID_HANDOFF)
 
     def test_unwritable_project_falls_back_to_private_state_copy(self):
@@ -1579,11 +1581,11 @@ class HandoffServiceTests(unittest.TestCase):
                 (
                     str(self.root),
                     "This thread continues work handed off from thr-old.\n"
-                    f"Read project instructions and {target}. Verify durable "
+                    f"Read project instructions and {service._private_target(pending_id)}. Verify durable "
                     "source-of-truth files before trusting the summary.\n"
                     "Continue from the single “Next Step” in the handoff. Do not "
                     "redo completed work. Report any contradiction before changing "
-                    "files.",
+                    "files.\n默认使用中文与用户沟通，除非用户另有要求。",
                 )
             ],
         )

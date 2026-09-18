@@ -6,8 +6,10 @@ Use the Python interpreter running the Hook (`sys.executable`) and the absolute 
 
 The draft must contain the four top-level headings required by `SKILL.md`, contain no more than 80 logical lines, and keep the target beneath the project root. A single terminal newline terminates the final content line without adding another line; every additional trailing blank line counts toward 80.
 
+Each transfer saves a private snapshot named by `pending_id`. Continuation and recovery prompts reference that snapshot; the project target is a replaceable latest copy. Another handoff in the same project cannot change the snapshot referenced by an earlier continuation.
+
 ```bash
-"<sys.executable>" "<absolute-skill-directory>/scripts/handoffctl.py" prepare --cwd "<absolute-project-root>" --from-file "<absolute-draft-file>" --target "docs/AI-HANDOFF.md"
+"<sys.executable>" "<absolute-skill-directory>/scripts/handoffctl.py" prepare --cwd "<absolute-project-root>" --from-file "<absolute-draft-file>" --target "docs/AI-HANDOFF.md" --conversation-language "<source-conversation-language>"
 ```
 
 Read `pending_id` from the JSON response. When Hooks are installed, reviewed, and trusted through `/hooks`, ask for confirmation and end the assistant response with exactly one canonical marker. The trusted `Stop` Hook arms the handoff and launches the five-minute wait worker:
@@ -48,6 +50,7 @@ If a timer, Hook, or transfer fails, run `status` and follow the exact state:
 
 | State | Meaning and recovery |
 | --- | --- |
+| `transferring` | A worker claimed the handoff but has not entered an external send phase. Run `status`. If it reports `recovery_command`, explicit recovery checks the worker lock without waiting and changes only an abandoned claim to `failed`; it sends nothing. A live worker or a later phase is left unchanged. Legacy claims without the lock marker require manual inspection and cannot use this recovery. |
 | `failed` | No external request may have been sent. After explicit user approval, `confirm` may retry the full transfer. Alternatively, copy the complete `recovery_prompt`, enter `/new` in the same project, paste it unchanged, and send it. |
 | `thread_created` | `new_thread_id` is durable and no turn may have been sent. After explicit user approval, `confirm` starts only the turn in that existing thread; it never creates another thread. |
 | `thread_starting` | Thread creation may have happened, but the outcome or thread ID is not safely durable. Do not run `confirm` or retry. Inspect the App Server/UI and `recovery_prompt`; the old thread remains blocked. |
@@ -56,6 +59,10 @@ If a timer, Hook, or transfer fails, run `status` and follow the exact state:
 | `transferred` | Transfer completed. Report the exact `resume_command` and use it to open the destination; never resume duplicate work in the old thread. |
 
 If an ambiguous state is inspected and work is missing, any manual recovery is a new user-authorized action, not a retry by this workflow.
+
+Run the reported `recovery_command` only to inspect and release an abandoned pre-send claim. Check `status` afterward: if it is `failed`, use the existing explicit-confirmation retry or cancellation rules. A null recovery result does not authorize a retry. New handoffs cannot supersede a transferring, ambiguous, or already transferred record in the same session.
+
+Pending-record ownership is persisted separately from its contents. A corrupt record blocks its owning session; unreadable records outside the current session emit an identifier-only warning for manual inspection. Legacy records use the session cache as ownership evidence until readable records are indexed. If both legacy ownership evidence and record contents are lost, ownership cannot be reconstructed automatically. Do not delete state to bypass inspection.
 
 Transfer depends on the local Codex App Server daemon. For each App Server connection, the controller holds a process-safe lock from preflight through the request response and proxy cleanup, starts the daemon if needed, compares the JSON `cliVersion` and `appServerVersion`, then uses the proxy's WebSocket protocol. It continues directly when the versions match. On a proven mismatch it runs one `daemon restart` with a 90-second lifecycle timeout, rechecks, and fails before `thread/start` or `turn/start` if compatibility still cannot be proven. A preflight failure does not authorize retrying a failed handoff; the state-specific approval rules above still apply.
 
