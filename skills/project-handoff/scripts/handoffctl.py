@@ -82,9 +82,12 @@ def _build_service():
         else Path.home() / ".codex"
     )
     state_root = codex_home / "state" / "project-handoff"
+    store = StateStore(state_root, now=time.time)
     return HandoffService(
-        store=StateStore(state_root, now=time.time),
-        app_server_client=AppServerClient(),
+        store=store,
+        app_server_client=AppServerClient(
+            daemon_lock_factory=store.daemon_locked,
+        ),
         private_handoff_dir=state_root / "handoffs",
     )
 

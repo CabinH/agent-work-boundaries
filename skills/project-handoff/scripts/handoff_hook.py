@@ -298,12 +298,21 @@ def _terminal_prompt_output(status, session_id):
         destination = status.get("new_thread_id")
         if not isinstance(destination, str) or not destination:
             return _in_progress_block(session_id)
-        return {
-            "decision": "block",
-            "reason": (
+        resume_command = status.get("resume_command")
+        if isinstance(resume_command, str) and resume_command:
+            reason = (
+                f"This conversation was handed off to thread {destination}; "
+                f"resume it with {resume_command} instead of continuing "
+                "duplicate work here."
+            )
+        else:
+            reason = (
                 f"This conversation was handed off to thread {destination}; "
                 "open that thread instead of continuing duplicate work."
-            ),
+            )
+        return {
+            "decision": "block",
+            "reason": reason,
         }
     if state == "failed":
         context = _failed_recovery_context(status)

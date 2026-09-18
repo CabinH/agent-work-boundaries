@@ -1,7 +1,12 @@
+import base64
+import hashlib
 import io
 import json
+from contextlib import contextmanager
+import os
 from pathlib import Path
 import queue
+import struct
 import subprocess
 import sys
 import threading
@@ -90,6 +95,180 @@ class TrackedStringIO(io.StringIO):
         super().close()
 
 
+class TrackedBytesIO(io.BytesIO):
+    def __init__(self, value=b""):
+        super().__init__(value)
+        self.was_closed = False
+
+    def close(self):
+        self.was_closed = True
+        super().close()
+
+
+class WebSocketProxyProcess:
+    def __init__(self):
+        server_read, client_write = os.pipe()
+        client_read, server_write = os.pipe()
+        self.stdin = os.fdopen(client_write, "wb", buffering=0)
+        self.stdout = os.fdopen(client_read, "rb", buffering=0)
+        self._server_input = os.fdopen(server_read, "rb", buffering=0)
+        self._server_output = os.fdopen(server_write, "wb", buffering=0)
+        self.stderr = TrackedBytesIO()
+        self.received_messages = []
+        self.client_frames_were_masked = []
+        self.terminated = False
+        self.waited = False
+        self._server_error = None
+        self._server_thread = threading.Thread(
+            target=self._serve,
+            name="test-websocket-proxy-server",
+            daemon=True,
+        )
+        self._server_thread.start()
+
+    @staticmethod
+    def _read_exact(stream, count):
+        chunks = []
+        remaining = count
+        while remaining:
+            chunk = stream.read(remaining)
+            if not chunk:
+                raise EOFError("client closed")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    @classmethod
+    def _read_client_text(cls, stream):
+        first, second = cls._read_exact(stream, 2)
+        masked = bool(second & 0x80)
+        length = second & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", cls._read_exact(stream, 2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", cls._read_exact(stream, 8))[0]
+        mask = cls._read_exact(stream, 4) if masked else b""
+        payload = cls._read_exact(stream, length)
+        if masked:
+            payload = bytes(
+                byte ^ mask[index % 4]
+                for index, byte in enumerate(payload)
+            )
+        if first & 0x0F != 0x01:
+            raise ValueError("expected a text frame")
+        return payload.decode("utf-8"), masked
+
+    @staticmethod
+    def _server_text(message):
+        payload = json.dumps(message).encode("utf-8")
+        length = len(payload)
+        if length < 126:
+            header = bytes((0x81, length))
+        elif length <= 0xFFFF:
+            header = bytes((0x81, 126)) + struct.pack("!H", length)
+        else:
+            header = bytes((0x81, 127)) + struct.pack("!Q", length)
+        return header + payload
+
+    def _serve(self):
+        input_stream = self._server_input
+        output_stream = self._server_output
+        try:
+            request = bytearray()
+            while b"\r\n\r\n" not in request:
+                request.extend(self._read_exact(input_stream, 1))
+            headers = request.decode("ascii").split("\r\n")
+            key = next(
+                line.split(":", 1)[1].strip()
+                for line in headers
+                if line.lower().startswith("sec-websocket-key:")
+            )
+            accept = base64.b64encode(
+                hashlib.sha1(
+                    (
+                        key
+                        + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+                    ).encode("ascii")
+                ).digest()
+            ).decode("ascii")
+            output_stream.write(
+                (
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                ).encode("ascii")
+            )
+            output_stream.flush()
+
+            for _ in range(3):
+                payload, masked = self._read_client_text(input_stream)
+                message = json.loads(payload)
+                self.received_messages.append(message)
+                self.client_frames_were_masked.append(masked)
+                if message.get("method") == "initialize":
+                    output_stream.write(
+                        self._server_text(
+                            {"id": 1, "result": {"capabilities": {}}}
+                        )
+                    )
+                    output_stream.flush()
+                elif message.get("method") == "thread/start":
+                    output_stream.write(
+                        self._server_text(
+                            {
+                                "id": 2,
+                                "result": {"thread": {"id": "thr-new"}},
+                            }
+                        )
+                    )
+                    output_stream.flush()
+        except (EOFError, OSError, ValueError) as error:
+            if not self.terminated:
+                self._server_error = error
+        finally:
+            input_stream.close()
+            output_stream.close()
+
+    def terminate(self):
+        self.terminated = True
+        try:
+            self._server_input.close()
+        except OSError:
+            pass
+
+    def wait(self, timeout=None):
+        self.waited = True
+        self._server_thread.join(timeout)
+        if self._server_thread.is_alive():
+            raise subprocess.TimeoutExpired("codex app-server proxy", timeout)
+        if self._server_error is not None:
+            raise AssertionError("fake WebSocket server failed") from self._server_error
+        return 0
+
+    def kill(self):
+        self.terminate()
+
+
+class JsonLineTransport:
+    def __init__(self, process, _handshake_timeout):
+        self._input = process.stdin
+        self._output = process.stdout
+
+    def open(self):
+        return None
+
+    def write_message(self, payload):
+        self._input.write(payload + "\n")
+        self._input.flush()
+
+    def read_message(self):
+        line = self._output.readline()
+        if line == "":
+            raise EOFError("proxy closed")
+        return line
+
+
 class BlockingOutput:
     def __init__(self, lines):
         self._lines = list(lines)
@@ -107,6 +286,33 @@ class BlockingOutput:
     def close(self):
         self.was_closed = True
         self._unblock.set()
+
+
+class GatedResponseOutput:
+    def __init__(self, first_response, gated_response):
+        self._first_response = json.dumps(first_response) + "\n"
+        self._gated_response = json.dumps(gated_response) + "\n"
+        self._read_count = 0
+        self.gated_read_entered = threading.Event()
+        self.release_gated_read = threading.Event()
+        self._closed = threading.Event()
+        self.was_closed = False
+
+    def readline(self):
+        self._read_count += 1
+        if self._read_count == 1:
+            return self._first_response
+        if self._read_count == 2:
+            self.gated_read_entered.set()
+            self.release_gated_read.wait()
+            return self._gated_response
+        self._closed.wait()
+        return ""
+
+    def close(self):
+        self.was_closed = True
+        self.release_gated_read.set()
+        self._closed.set()
 
 
 class FakeProcess:
@@ -148,19 +354,45 @@ class TerminateTimeoutProcess(FakeProcess):
 
 
 class AppServerClientTests(unittest.TestCase):
-    def make_client(self, process, run_command=None, request_timeout=1.0):
+    def make_client(
+        self,
+        process,
+        run_command=None,
+        request_timeout=1.0,
+        websocket=False,
+    ):
         if run_command is None:
-            run_command = lambda command, **kwargs: None
+            def run_command(command, **kwargs):
+                stdout = ""
+                if command[-1] == "version":
+                    stdout = json.dumps(
+                        {
+                            "status": "running",
+                            "cliVersion": "0.154.0",
+                            "appServerVersion": "0.154.0",
+                        }
+                    )
+                return subprocess.CompletedProcess(command, 0, stdout, "")
+        kwargs = {}
+        if not websocket:
+            kwargs["transport_factory"] = JsonLineTransport
         return AppServerClient(
             run_command=run_command,
             popen_factory=lambda command, **kwargs: process,
             request_timeout=request_timeout,
+            daemon_lock_factory=lambda: threading.Lock(),
+            **kwargs,
         )
 
     def assert_proxy_cleaned_up(self, process):
-        self.assertTrue(process.stdin.was_closed)
-        self.assertTrue(process.stdout.was_closed)
-        self.assertTrue(process.stderr.was_closed)
+        def was_closed(stream):
+            return getattr(stream, "was_closed", False) or getattr(
+                stream, "closed", False
+            )
+
+        self.assertTrue(was_closed(process.stdin))
+        self.assertTrue(was_closed(process.stdout))
+        self.assertTrue(was_closed(process.stderr))
         self.assertTrue(process.terminated)
         self.assertTrue(process.waited)
 
@@ -200,6 +432,33 @@ class AppServerClientTests(unittest.TestCase):
         self.assertFalse(hasattr(client, "launch"))
         self.assertFalse(hasattr(app_server_client, "LaunchResult"))
 
+    def test_start_thread_uses_websocket_protocol_through_proxy(self):
+        process = WebSocketProxyProcess()
+
+        thread_id = self.make_client(
+            process,
+            request_timeout=1.0,
+            websocket=True,
+        ).start_thread(
+            "/workspace/repo",
+            before_send=lambda: None,
+        )
+
+        self.assertEqual(thread_id, "thr-new")
+        self.assertEqual(
+            [message["method"] for message in process.received_messages],
+            ["initialize", "initialized", "thread/start"],
+        )
+        self.assertEqual(process.client_frames_were_masked, [True, True, True])
+        self.assert_proxy_cleaned_up(process)
+
+    def test_constructor_requires_cross_process_daemon_lock_factory(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "daemon_lock_factory is required",
+        ):
+            AppServerClient()
+
     def test_daemon_start_is_bounded_and_timeout_is_sanitized(self):
         proxy_started = []
 
@@ -215,6 +474,7 @@ class AppServerClientTests(unittest.TestCase):
             run_command=timeout_daemon,
             popen_factory=lambda command, **kwargs: proxy_started.append(command),
             request_timeout=0.25,
+            daemon_lock_factory=lambda: threading.Lock(),
         )
 
         with self.assertRaisesRegex(
@@ -837,6 +1097,16 @@ class AppServerClientTests(unittest.TestCase):
 
         def run_command(command, **kwargs):
             daemon_commands.append((command, kwargs))
+            stdout = ""
+            if command[-1] == "version":
+                stdout = json.dumps(
+                    {
+                        "status": "running",
+                        "cliVersion": "0.154.0",
+                        "appServerVersion": "0.154.0",
+                    }
+                )
+            return subprocess.CompletedProcess(command, 0, stdout, "")
 
         def popen_factory(command, **kwargs):
             proxy_commands.append((command, kwargs))
@@ -846,6 +1116,8 @@ class AppServerClientTests(unittest.TestCase):
             run_command=run_command,
             popen_factory=popen_factory,
             request_timeout=1.0,
+            daemon_lock_factory=lambda: threading.Lock(),
+            transport_factory=JsonLineTransport,
         )
 
         result = client.start_thread(
@@ -887,7 +1159,16 @@ class AppServerClientTests(unittest.TestCase):
                         "text": True,
                         "timeout": 1.0,
                     },
-                )
+                ),
+                (
+                    ["codex", "app-server", "daemon", "version"],
+                    {
+                        "check": True,
+                        "capture_output": True,
+                        "text": True,
+                        "timeout": 1.0,
+                    },
+                ),
             ],
         )
         self.assertEqual(
@@ -899,13 +1180,400 @@ class AppServerClientTests(unittest.TestCase):
                         "stdin": subprocess.PIPE,
                         "stdout": subprocess.PIPE,
                         "stderr": subprocess.PIPE,
-                        "text": True,
-                        "bufsize": 1,
+                        "text": False,
+                        "bufsize": 0,
                     },
                 )
             ],
         )
         self.assert_proxy_cleaned_up(process)
+
+    def test_matching_daemon_version_is_checked_before_proxy_start(self):
+        process = FakeProcess(
+            [
+                {"id": 1, "result": {"capabilities": {}}},
+                {"id": 2, "result": {"thread": {"id": "thr-new"}}},
+            ]
+        )
+        events = []
+
+        def run_command(command, **kwargs):
+            events.append(list(command))
+            stdout = ""
+            if command[-1] == "version":
+                stdout = json.dumps(
+                    {
+                        "status": "running",
+                        "cliVersion": "0.154.0",
+                        "appServerVersion": "0.154.0",
+                    }
+                )
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        client = AppServerClient(
+            run_command=run_command,
+            popen_factory=lambda command, **kwargs: process,
+            request_timeout=1.0,
+            daemon_lock_factory=lambda: threading.Lock(),
+            transport_factory=JsonLineTransport,
+        )
+
+        result = client.start_thread(
+            "/workspace/repo",
+            before_send=lambda: None,
+        )
+
+        self.assertEqual(result, "thr-new")
+        self.assertEqual(
+            events,
+            [
+                ["codex", "app-server", "daemon", "start"],
+                ["codex", "app-server", "daemon", "version"],
+            ],
+        )
+
+    def test_daemon_preflight_holds_supplied_lock_until_versions_match(self):
+        process = FakeProcess(
+            [
+                {"id": 1, "result": {"capabilities": {}}},
+                {"id": 2, "result": {"thread": {"id": "thr-new"}}},
+            ]
+        )
+        events = []
+
+        @contextmanager
+        def daemon_lock():
+            events.append("lock-enter")
+            try:
+                yield
+            finally:
+                events.append("lock-exit")
+
+        def run_command(command, **kwargs):
+            events.append(command[-1])
+            stdout = ""
+            if command[-1] == "version":
+                stdout = json.dumps(
+                    {
+                        "status": "running",
+                        "cliVersion": "0.154.0",
+                        "appServerVersion": "0.154.0",
+                    }
+                )
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        def popen_factory(command, **kwargs):
+            events.append("proxy")
+            return process
+
+        client = AppServerClient(
+            run_command=run_command,
+            popen_factory=popen_factory,
+            request_timeout=1.0,
+            daemon_lock_factory=daemon_lock,
+            transport_factory=JsonLineTransport,
+        )
+
+        client.start_thread("/workspace/repo", before_send=lambda: None)
+
+        self.assertEqual(
+            events,
+            ["lock-enter", "start", "version", "proxy", "lock-exit"],
+        )
+
+    def test_competing_version_cannot_restart_during_proxy_operation(self):
+        daemon_version = ["0.154.0"]
+        shared_lock = threading.Lock()
+        first_stdout = GatedResponseOutput(
+            {"id": 1, "result": {"capabilities": {}}},
+            {"id": 2, "result": {"thread": {"id": "thr-first"}}},
+        )
+        first_process = FakeProcess(stdout=first_stdout)
+        second_process = FakeProcess(
+            [
+                {"id": 1, "result": {"capabilities": {}}},
+                {"id": 2, "result": {"thread": {"id": "thr-second"}}},
+            ]
+        )
+        second_restart = threading.Event()
+        results = {}
+        failures = []
+
+        def runner(cli_version, restart_event=None):
+            def run_command(command, **kwargs):
+                action = command[-1]
+                if action == "restart":
+                    daemon_version[0] = cli_version
+                    if restart_event is not None:
+                        restart_event.set()
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                stdout = ""
+                if action == "version":
+                    stdout = json.dumps(
+                        {
+                            "status": "running",
+                            "cliVersion": cli_version,
+                            "appServerVersion": daemon_version[0],
+                        }
+                    )
+                return subprocess.CompletedProcess(command, 0, stdout, "")
+
+            return run_command
+
+        first_client = AppServerClient(
+            run_command=runner("0.154.0"),
+            popen_factory=lambda command, **kwargs: first_process,
+            request_timeout=1.0,
+            daemon_lock_factory=lambda: shared_lock,
+            transport_factory=JsonLineTransport,
+        )
+        second_client = AppServerClient(
+            run_command=runner("0.155.0", second_restart),
+            popen_factory=lambda command, **kwargs: second_process,
+            request_timeout=1.0,
+            daemon_lock_factory=lambda: shared_lock,
+            transport_factory=JsonLineTransport,
+        )
+
+        def start(name, client):
+            try:
+                results[name] = client.start_thread(
+                    "/workspace/repo",
+                    before_send=lambda: None,
+                )
+            except BaseException as error:
+                failures.append(error)
+
+        first_thread = threading.Thread(
+            target=start,
+            args=("first", first_client),
+            daemon=True,
+        )
+        second_thread = threading.Thread(
+            target=start,
+            args=("second", second_client),
+            daemon=True,
+        )
+        first_thread.start()
+        self.assertTrue(first_stdout.gated_read_entered.wait(1.0))
+        second_thread.start()
+
+        self.assertFalse(second_restart.wait(0.1))
+        first_stdout.release_gated_read.set()
+        first_thread.join(2.0)
+        second_thread.join(2.0)
+
+        self.assertEqual(failures, [])
+        self.assertEqual(results, {"first": "thr-first", "second": "thr-second"})
+        self.assertTrue(second_restart.is_set())
+
+    def test_mismatched_daemon_is_restarted_and_rechecked_before_proxy(self):
+        process = FakeProcess(
+            [
+                {"id": 1, "result": {"capabilities": {}}},
+                {"id": 2, "result": {"thread": {"id": "thr-new"}}},
+            ]
+        )
+        events = []
+        version_results = iter(
+            [
+                ("0.154.0", "0.149.1"),
+                ("0.154.0", "0.154.0"),
+            ]
+        )
+
+        def run_command(command, **kwargs):
+            events.append(list(command))
+            stdout = ""
+            if command[-1] == "version":
+                cli_version, app_server_version = next(version_results)
+                stdout = json.dumps(
+                    {
+                        "status": "running",
+                        "cliVersion": cli_version,
+                        "appServerVersion": app_server_version,
+                    }
+                )
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        client = AppServerClient(
+            run_command=run_command,
+            popen_factory=lambda command, **kwargs: process,
+            request_timeout=1.0,
+            daemon_lock_factory=lambda: threading.Lock(),
+            transport_factory=JsonLineTransport,
+        )
+
+        result = client.start_thread(
+            "/workspace/repo",
+            before_send=lambda: None,
+        )
+
+        self.assertEqual(result, "thr-new")
+        self.assertEqual(
+            events,
+            [
+                ["codex", "app-server", "daemon", "start"],
+                ["codex", "app-server", "daemon", "version"],
+                ["codex", "app-server", "daemon", "restart"],
+                ["codex", "app-server", "daemon", "version"],
+            ],
+        )
+
+    def test_daemon_restart_uses_lifecycle_timeout_not_rpc_timeout(self):
+        process = FakeProcess(
+            [
+                {"id": 1, "result": {"capabilities": {}}},
+                {"id": 2, "result": {"thread": {"id": "thr-new"}}},
+            ]
+        )
+        observed_timeouts = []
+        versions = iter(
+            [
+                ("0.154.0", "0.149.1"),
+                ("0.154.0", "0.154.0"),
+            ]
+        )
+
+        def run_command(command, **kwargs):
+            action = command[-1]
+            observed_timeouts.append((action, kwargs["timeout"]))
+            stdout = ""
+            if action == "version":
+                cli_version, app_server_version = next(versions)
+                stdout = json.dumps(
+                    {
+                        "status": "running",
+                        "cliVersion": cli_version,
+                        "appServerVersion": app_server_version,
+                    }
+                )
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        client = AppServerClient(
+            run_command=run_command,
+            popen_factory=lambda command, **kwargs: process,
+            request_timeout=0.5,
+            daemon_lock_factory=lambda: threading.Lock(),
+            transport_factory=JsonLineTransport,
+        )
+
+        self.assertEqual(
+            client.start_thread(
+                "/workspace/repo",
+                before_send=lambda: None,
+            ),
+            "thr-new",
+        )
+        self.assertEqual(
+            observed_timeouts,
+            [
+                ("start", 0.5),
+                ("version", 0.5),
+                ("restart", 90.0),
+                ("version", 0.5),
+            ],
+        )
+
+    def test_persistent_daemon_version_mismatch_fails_before_proxy(self):
+        proxy_started = []
+
+        def run_command(command, **kwargs):
+            stdout = ""
+            if command[-1] == "version":
+                stdout = json.dumps(
+                    {
+                        "status": "running",
+                        "cliVersion": "0.154.0",
+                        "appServerVersion": "0.149.1",
+                    }
+                )
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        client = AppServerClient(
+            run_command=run_command,
+            popen_factory=lambda command, **kwargs: proxy_started.append(command),
+            request_timeout=1.0,
+            daemon_lock_factory=lambda: threading.Lock(),
+        )
+
+        with self.assertRaisesRegex(
+            app_server_client.AppServerError,
+            "remained mismatched",
+        ) as raised:
+            client.start_thread(
+                "/workspace/repo",
+                before_send=lambda: None,
+            )
+
+        self.assertFalse(raised.exception.request_may_have_been_sent)
+        self.assertEqual(proxy_started, [])
+
+    def test_daemon_restart_failure_is_unsent_and_names_restart(self):
+        proxy_started = []
+
+        def run_command(command, **kwargs):
+            if command[-1] == "version":
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    json.dumps(
+                        {
+                            "status": "running",
+                            "cliVersion": "0.154.0",
+                            "appServerVersion": "0.149.1",
+                        }
+                    ),
+                    "",
+                )
+            if command[-1] == "restart":
+                raise subprocess.CalledProcessError(7, command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        client = AppServerClient(
+            run_command=run_command,
+            popen_factory=lambda command, **kwargs: proxy_started.append(command),
+            request_timeout=1.0,
+            daemon_lock_factory=lambda: threading.Lock(),
+        )
+
+        with self.assertRaisesRegex(
+            app_server_client.AppServerError,
+            "failed to restart.*7",
+        ) as raised:
+            client.start_thread(
+                "/workspace/repo",
+                before_send=lambda: None,
+            )
+
+        self.assertFalse(raised.exception.request_may_have_been_sent)
+        self.assertEqual(proxy_started, [])
+
+    def test_invalid_daemon_version_response_fails_before_proxy(self):
+        proxy_started = []
+
+        def run_command(command, **kwargs):
+            stdout = "not-json" if command[-1] == "version" else ""
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        client = AppServerClient(
+            run_command=run_command,
+            popen_factory=lambda command, **kwargs: proxy_started.append(command),
+            request_timeout=1.0,
+            daemon_lock_factory=lambda: threading.Lock(),
+        )
+
+        with self.assertRaisesRegex(
+            app_server_client.AppServerError,
+            "version check returned invalid data",
+        ) as raised:
+            client.start_thread(
+                "/workspace/repo",
+                before_send=lambda: None,
+            )
+
+        self.assertFalse(raised.exception.request_may_have_been_sent)
+        self.assertEqual(proxy_started, [])
 
     def test_start_thread_rejects_returned_nonzero_daemon_status(self):
         process = FakeProcess(
@@ -932,6 +1600,7 @@ class AppServerClientTests(unittest.TestCase):
             run_command=return_failure,
             popen_factory=start_proxy,
             request_timeout=1.0,
+            daemon_lock_factory=lambda: threading.Lock(),
         )
 
         with self.assertRaisesRegex(
@@ -962,6 +1631,7 @@ class AppServerClientTests(unittest.TestCase):
             run_command=fail_daemon,
             popen_factory=lambda command, **kwargs: proxy_started.append(command),
             request_timeout=1.0,
+            daemon_lock_factory=lambda: threading.Lock(),
         )
 
         with self.assertRaisesRegex(

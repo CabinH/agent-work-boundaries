@@ -79,8 +79,8 @@ python3 ~/.codex/skills/project-handoff/scripts/handoffctl.py status --session-i
 Replace `<current-session-id>` with the real ID of the current Codex session;
 the angle-bracket token is user-supplied command syntax, not an implementation
 field. On transfer, App Server creates and starts the new thread, but the
-current Codex UI may not focus it automatically. Use the reported thread ID to
-open it when necessary.
+current Codex UI may not focus it automatically. Use the reported, copyable
+`resume_command` to open it with the correct absolute working directory.
 
 Recovery depends on the reported state:
 
@@ -91,13 +91,22 @@ Recovery depends on the reported state:
 - `thread_starting`, `turn_starting`, and `indeterminate` may have external
   effects. Do not run `confirm` or retry them; inspect App Server/UI state and
   the recovery fields while the old thread remains blocked.
-- `transferred` reports the destination in `new_thread_id`; open it and do not
-  resume duplicate work in the old conversation.
+- `transferred` reports the destination in `new_thread_id` and the complete
+  `codex resume <id> -C <cwd>` command; use it and do not resume duplicate work
+  in the old conversation.
 
-The local Codex App Server daemon has a finite startup timeout. A daemon
-failure can therefore produce `failed` before any send, while a lost response
-after a possible send produces a blocked inspection state. UI focus is not a
-success signal; rely on durable status and the reported destination.
+Before each connection, the controller checks the running daemon's version
+against the CLI under a process-safe lock. It restarts the daemon only when a
+mismatch is proven, allows up to 90 seconds for that rare lifecycle operation,
+verifies the result, and otherwise fails before sending an external request.
+The local proxy is spoken as WebSocket rather than newline-delimited stdio. A
+daemon or socket-permission failure can therefore produce `failed` before any
+send, while a lost response after a possible send produces a blocked
+inspection state. UI focus is not a success signal; rely on durable status and
+the reported destination. With PowerShell over SSH, run `resume_command` in
+the Linux SSH shell; it targets the remote absolute working directory. If a
+managed command sandbox blocks the remote user's `~/.codex` Unix socket, the
+controller invocation needs narrow approval outside that sandbox.
 
 ## Uninstall and restore
 

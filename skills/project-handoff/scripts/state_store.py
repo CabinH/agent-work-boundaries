@@ -521,6 +521,9 @@ class StateStore:
         )
         return _RecordLock(self.locks_dir / f"authority-{lock_id}.lock")
 
+    def daemon_locked(self):
+        return _RecordLock(self.locks_dir / "app-server-daemon.lock")
+
     def _persist(self, record: dict[str, object]) -> None:
         session_id = record.get("session_id")
         if isinstance(session_id, str):

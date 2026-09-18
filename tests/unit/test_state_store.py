@@ -64,6 +64,41 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(errors, [])
         return results
 
+    def test_daemon_lock_serializes_independent_processes(self):
+        store = StateStore(self.root, now=lambda: 0.0)
+        child_script = r"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from state_store import StateStore
+
+store = StateStore(Path(sys.argv[2]), now=lambda: 0.0)
+with store.daemon_locked():
+    print("acquired", flush=True)
+"""
+        with store.daemon_locked():
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    child_script,
+                    str(SCRIPTS_DIR),
+                    str(self.root),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            with self.assertRaises(subprocess.TimeoutExpired):
+                process.communicate(timeout=0.2)
+
+        stdout, stderr = process.communicate(timeout=2.0)
+
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(stdout, "acquired\n")
+        self.assertEqual(stderr, "")
+
     def run_lock_collision_subprocess(self, operation):
         script = r"""
 import sys

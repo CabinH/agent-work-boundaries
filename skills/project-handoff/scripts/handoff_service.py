@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import secrets
+import shlex
 import stat
 import sys
 import tempfile
@@ -123,7 +124,7 @@ class HandoffService:
                 recovery_mode="inspect_external_outcome",
                 inspection_required=True,
             )
-        return status
+        return self._with_runtime_guidance(status)
 
     def _transfer_claimed(self, record):
         if record["state"] == "thread_created":
@@ -242,7 +243,25 @@ class HandoffService:
         transferred = self.store.mark_transferred(pending_id, thread_id)
         if transferred is None:
             raise RuntimeError("transferred state could not be persisted")
-        return transferred
+        return self._with_runtime_guidance(transferred)
+
+    @staticmethod
+    def _with_runtime_guidance(record):
+        status = dict(record)
+        if status.get("state") != "transferred":
+            return status
+        thread_id = status.get("new_thread_id")
+        cwd = status.get("cwd")
+        if (
+            isinstance(thread_id, str)
+            and thread_id
+            and isinstance(cwd, str)
+            and cwd
+        ):
+            status["resume_command"] = shlex.join(
+                ["codex", "resume", thread_id, "-C", cwd]
+            )
+        return status
 
     def _recovery_prompt_after_failure(self, record, handoff_path):
         if handoff_path is None:

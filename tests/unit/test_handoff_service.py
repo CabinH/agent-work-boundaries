@@ -1,4 +1,5 @@
 import os
+import shlex
 import stat
 import sys
 import tempfile
@@ -303,6 +304,31 @@ class HandoffServiceTests(unittest.TestCase):
         self.assertEqual(target.read_text(), VALID_HANDOFF)
         self.assertEqual(result["new_thread_id"], "thr-new")
         self.assertEqual(len(client.calls), 1)
+
+    def test_success_returns_copyable_resume_command_with_absolute_cwd(self):
+        project = self.root / "repo with spaces"
+        project.mkdir()
+        client = RecordingClient()
+        service = HandoffService(
+            store=StateStore(self.root / "state", now=lambda: 100.0),
+            app_server_client=client,
+            private_handoff_dir=self.root / "private",
+        )
+        pending_id = service.prepare(
+            project,
+            VALID_HANDOFF,
+            "docs/AI-HANDOFF.md",
+        )
+        service.arm(pending_id, session_id="thr-old", timeout_seconds=300)
+
+        result = service.confirm(pending_id)
+        status = service.status("thr-old")
+
+        expected = shlex.join(
+            ["codex", "resume", "thr-new", "-C", str(project.resolve())]
+        )
+        self.assertEqual(result["resume_command"], expected)
+        self.assertEqual(status["resume_command"], expected)
 
     def test_project_publish_replaces_within_verified_parent_descriptor(self):
         service, _client, _clock = self.make_service()

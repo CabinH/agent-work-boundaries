@@ -34,7 +34,7 @@ With trusted Hooks, any user prompt atomically stops an armed countdown. Then us
 "<sys.executable>" "<absolute-skill-directory>/scripts/handoffctl.py" status --session-id "<current-session-id>"
 ```
 
-`confirm` publishes the handoff and starts a new thread, except that a `thread_created` record resumes only the turn in its already recorded thread. `cancel` disarms it. `status` reports the durable record, including recovery mode and the destination thread when known.
+`confirm` publishes the handoff and starts a new thread, except that a `thread_created` record resumes only the turn in its already recorded thread. `cancel` disarms it. `status` reports the durable record, including recovery mode and the destination thread when known. A successful `confirm`, `wait`, or `status` result includes a shell-quoted `resume_command` such as `codex resume <new_thread_id> -C <absolute-cwd>`.
 
 States progress through `draft`, `armed`, `responded` or `expired`, `transferring`, `thread_starting`, `thread_created`, `turn_starting`, then `transferred`; alternatives are `cancelled`, retryable `failed`, and non-retryable `indeterminate`. Only one local confirmation-or-expiry claimant wins. That claimant makes at most one automatic send attempt for each external phase; this is not an external exactly-once guarantee.
 
@@ -53,10 +53,12 @@ If a timer, Hook, or transfer fails, run `status` and follow the exact state:
 | `thread_starting` | Thread creation may have happened, but the outcome or thread ID is not safely durable. Do not run `confirm` or retry. Inspect the App Server/UI and `recovery_prompt`; the old thread remains blocked. |
 | `turn_starting` | The turn may have been sent to the durable `new_thread_id`. Do not run `confirm` or retry. Inspect that thread and the recovery data; the old thread remains blocked. |
 | `indeterminate` | The recorded `external_phase` was possibly sent and its result is ambiguous. Do not run `confirm` or any automatic retry. Inspect the reported thread when present plus App Server/UI state, then recover manually; the old thread remains blocked. |
-| `transferred` | Transfer completed. Report and open the destination in `new_thread_id`; never resume duplicate work in the old thread. |
+| `transferred` | Transfer completed. Report the exact `resume_command` and use it to open the destination; never resume duplicate work in the old thread. |
 
 If an ambiguous state is inspected and work is missing, any manual recovery is a new user-authorized action, not a retry by this workflow.
 
-Transfer depends on the local Codex App Server daemon. Daemon startup has a finite timeout and may fail before a send; successful App Server creation still may not focus or visibly open the new thread in the current UI. Use `status` and the reported `new_thread_id`; do not infer success from UI focus. If project publication is unavailable, `recovery_prompt` points to the private saved handoff instead.
+Transfer depends on the local Codex App Server daemon. For each App Server connection, the controller holds a process-safe lock from preflight through the request response and proxy cleanup, starts the daemon if needed, compares the JSON `cliVersion` and `appServerVersion`, then uses the proxy's WebSocket protocol. It continues directly when the versions match. On a proven mismatch it runs one `daemon restart` with a 90-second lifecycle timeout, rechecks, and fails before `thread/start` or `turn/start` if compatibility still cannot be proven. A preflight failure does not authorize retrying a failed handoff; the state-specific approval rules above still apply.
+
+Successful App Server creation may not focus or visibly open the new thread in the current UI. Use `status` and its exact `resume_command`; do not infer success from UI focus. Under PowerShell → SSH → Linux, run that command in the Linux SSH shell because its quoting and absolute `-C` path target the remote host. Direct SSH-shell execution is supported. If an agent instead launches the controller through a managed sandbox that blocks `~/.codex` state or the daemon's Unix socket, request the narrow approval needed for the controller command; an `EPERM` socket failure is not evidence of a version mismatch. If project publication is unavailable, `recovery_prompt` points to the private saved handoff instead.
 
 On resume, read project instructions and the handoff, then verify durable source-of-truth files. Code, tests, commits, configuration, and current command results override the summary. Report contradictions before changing files; do not redo completed work. A transferred old conversation is superseded and must not continue duplicate work.

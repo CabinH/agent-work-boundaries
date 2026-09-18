@@ -196,6 +196,10 @@ class HandoffCtlTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(payload["state"], "transferred")
         self.assertEqual(payload["new_thread_id"], "thr-new")
+        self.assertEqual(
+            payload["resume_command"],
+            f"codex resume thr-new -C {self.root}",
+        )
         self.assertEqual(len(self.client.calls), 1)
 
     def test_cancel_outputs_cancelled_record(self):
@@ -230,6 +234,10 @@ class HandoffCtlTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(payload["state"], "transferred")
+        self.assertEqual(
+            payload["resume_command"],
+            f"codex resume thr-new -C {self.root}",
+        )
         self.assertEqual(self.clock.sleeps, [300.0])
 
     def test_invalid_pending_id_returns_one_clean_json_error(self):

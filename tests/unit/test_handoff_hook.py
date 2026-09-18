@@ -485,6 +485,9 @@ class HandoffHookStopAndPromptTests(unittest.TestCase):
                     "session_id": "thr-old",
                     "state": "transferred",
                     "new_thread_id": "thr-new",
+                    "resume_command": (
+                        "codex resume thr-new -C /workspace/repo"
+                    ),
                 }
             }
         )
@@ -501,7 +504,8 @@ class HandoffHookStopAndPromptTests(unittest.TestCase):
                 "decision": "block",
                 "reason": (
                     "This conversation was handed off to thread thr-new; "
-                    "open that thread instead of continuing duplicate work."
+                    "resume it with codex resume thr-new -C /workspace/repo "
+                    "instead of continuing duplicate work here."
                 ),
             },
         )
